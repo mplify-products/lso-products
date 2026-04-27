@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LSO Products</title>
+<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+<script src="https://cdn.jsdelivr.net/npm/d3-sankey@0.12.3"></script>
+<style>
+  :root {
+    --status-published: #1a8b3a;
+    --status-in-development: #f08c1f;
+    --status-planned: #1f5fbf;
+    --status-area: #9aa0a6;
+    --link-fill: #d8d8d8;
+    --link-fill-faded: #ececec;
+    --link-fill-highlight: #b8b8b8;
+    --bg: #ffffff;
+    --text: #202124;
+    --text-muted: #5f6368;
+    --column-header: #202124;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; -webkit-font-smoothing: antialiased; }
+  #app { width: 100vw; min-height: 100vh; padding: 24px 32px; position: relative; }
+  h1 { font-size: 28px; font-weight: 500; margin: 0 0 8px 0; letter-spacing: -0.01em; }
+  #legend { position: absolute; top: 28px; right: 32px; display: flex; gap: 18px; font-size: 12px; color: var(--text); }
+  #legend .item { display: flex; align-items: center; gap: 6px; }
+  #legend .swatch { width: 14px; height: 14px; border-radius: 2px; display: inline-block; }
+  #status { padding: 16px 0; color: var(--text-muted); font-size: 13px; }
+  #chart-wrap { width: 100%; overflow-x: auto; }
+  svg { display: block; }
+  .col-header { font-size: 13px; font-weight: 500; fill: var(--column-header); }
+  .node rect { cursor: pointer; transition: opacity 120ms ease; }
+  .node text { font-size: 12px; fill: var(--text); pointer-events: none; }
+  .node.dim rect, .node.dim text { opacity: 0.25; }
+  .link { fill: none; stroke: var(--link-fill); stroke-opacity: 0.6; transition: stroke 120ms ease, stroke-opacity 120ms ease; }
+  .link.dim { stroke: var(--link-fill-faded); stroke-opacity: 0.4; }
+  .link.highlight { stroke: var(--link-fill-highlight); stroke-opacity: 0.95; }
+  .node-hit { cursor: pointer; fill: transparent; }
+  #error { color: #b00020; padding: 16px 0; font-size: 13px; }
+  .tooltip { position: absolute; pointer-events: none; background: rgba(32,33,36,0.95); color: #fff; padding: 6px 10px; border-radius: 4px; font-size: 12px; line-height: 1.4; transform: translate(-50%, -120%); white-space: nowrap; opacity: 0; transition: opacity 100ms ease; }
+  .tooltip.visible { opacity: 1; }
+  @media (max-width: 900px) { h1 { font-size: 22px; } #legend { position: static; margin-top: 8px; flex-wrap: wrap; } }
+</style>
+</head>
+<body>
+<div id="app">
+  <h1>LSO Products</h1>
+  <div id="legend"></div>
+  <div id="status">Loading data…</div>
+  <div id="error"></div>
+  <div id="chart-wrap"><svg id="chart"></svg></div>
+  <div class="tooltip" id="tooltip"></div>
+</div>
+
+<script>
+/* =====================================================================
+   LSO Products Sankey
+   Data source: Google Sheet published as CSV (per-tab gid).
+   Tabs expected: nodes, links, type_order, legend
+   --------------------------------------------------------------------- */
+
+// Sheet ID and tab gids (filled in from the source sheet).
+const SHEET_ID = "1XNiWZ6RqXgCI5jWVvK94CuvNQVt8mFlC84UD5-ZdFeY";
+
+// Tab gids — the user must publish each tab to web as CSV.
+// "nodes" tab gid is known (1203637575). The others are auto-discovered
+// at runtime by trying named-range queries via gviz; if that fails, the
+// user can supply gids in the URL query string: ?nodes=...&links=...&type_order=...&legend=...
+const DEFAULT_GIDS = {
+  nodes: "1203637575"
+  // links, type_order, legend gids resolved via gviz "sheet" parameter (by tab name)
+};
+
+// CSV endpoint by gid:
+const csvByGid = (gid) =>
+  `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${gid}`;
+// CSV endpoint by sheet name (works when the sheet is "Anyone with the link can view"
+// AND "Publish to web" is enabled; tab names with spaces should be URL-encoded):
+const csvBySheetName = (name) =>
+  `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(name)}`;
+
+// Status -> color mapping
+const STATUS_COLOR = {
+  green:  "var(--status-published)",
+  orange: "var(--status-in-development)",
+  blue:   "var(--status-planned)",
+  grey:   "var(--status-area)",
+  gray:   "var(--status-area)"
+};
+const STATUS_LABEL = {
+  green:  "Published",
+  orange: "In Development",
+  blue:   "Planned",
+  grey:   "Area",
+  gray:   "Area"
+};
+
+// ---------- helpers ----------
+function qs(name) {
+  const u = new URL(window.location.href);
+  return u.searchParams.get(name);
+}
+
+async function fetchCsv(url) {
+  const res = await fetch(url, { redirect: "follow" });
+  if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`);
+  const text = await res.text();
+  return d3.csvParse(text);
+}
+
+// Try by-gid first (if provided), then fall back to by-sheet-name.
+async function loadTab(name) {
+  const overrideGid = qs(name);
+  const gid = overrideGid || DEFAULT_GIDS[name];
+  const attempts = [];
+  if (gid) attempts.push(csvByGid(gid));
+  attempts.push(csvBySheetName(name));
+  let lastErr;
+  for (const url of attempts) {
+    try {
+      const rows = await fetchCsv(url);
+      if (rows && rows.length) return rows;
+    } catch (e) { lastErr = e; }
+  }
+  throw new Error(`Could not load tab "${name}". ${lastErr ? lastErr.message : ""}`);
+}
+
+// ---------- main ----------
+(async function main() {
+  const statusEl = document.getElementById("status");
+  const errorEl  = document.getElementById("error");
+  try {
+    statusEl.textContent = "Loading data…";
+
+    const [nodesRows, linksRows, typeOrderRows, legendRows] = await Promise.all([
+      loadTab("nodes"),
+      loadTab("links"),
+      loadTab("type_order"),
+      loadTab("legend").catch(() => null) // legend is optional
+    ]);
+
+    statusEl.textContent = "";
+
+    // Normalise nodes
+    const nodes = nodesRows
+      .filter(r => r.name && r.name.trim())
+      .map(r => ({
+        name:   r.name.trim(),
+        type:   (r.type   || "").trim(),
+        url:    (r.url    || "").trim(),
+        status: (r.status || "").trim().toLowerCase()
+      }));
+
+    // Normalise links (expect columns: source, target [, value])
+    // Header names may vary; accept "from"/"to" too.
+    const linkKey = (row, candidates) => {
+      for (const k of candidates) if (row[k] != null && row[k] !== "") return row[k];
+      return null;
+    };
+    const links = linksRows
+      .map(r => ({
+        source: (linkKey(r, ["source", "Source", "from", "From"]) || "").toString().trim(),
+        target: (linkKey(r, ["target", "Target", "to",   "To"  ]) || "").toString().trim(),
+        value:  +(linkKey(r, ["value",  "Value", "weight"]) || 1)
+      }))
+      .filter(l => l.source && l.target);
+
+    // type_order: ordered list of column types (column = "type" or single column with header).
+    // Accept either a single-column list or an explicit "type" column.
+    const orderCol = (() => {
+      if (!typeOrderRows.length) return [];
+      const headers = Object.keys(typeOrderRows[0]);
+      const preferred = headers.find(h => /^type/i.test(h)) || headers[0];
+      return typeOrderRows.map(r => (r[preferred] || "").trim()).filter(Boolean);
+    })();
+    const typeOrder = orderCol.length ? orderCol : Array.from(new Set(nodes.map(n => n.type)));
+
+    // legend (optional): columns like status, label
+    const legend = (legendRows || []).map(r => ({
+      status: (r.status || r.Status || "").toString().trim().toLowerCase(),
+      label:  (r.label  || r.Label  || "").toString().trim()
+    })).filter(l => l.status);
+
+    renderLegend(legend);
+    renderSankey({ nodes, links, typeOrder });
+  } catch (err) {
+    statusEl.textContent = "";
+    errorEl.innerHTML =
+      `Failed to load data: ${err.message}<br>` +
+      `Make sure the sheet is published to the web (File → Share → Publish to web), ` +
+      `and that tabs are named exactly: <code>nodes</code>, <code>links</code>, <code>type_order</code>, <code>legend</code>. ` +
+      `You can also override gids via URL: <code>?nodes=GID&amp;links=GID&amp;type_order=GID&amp;legend=GID</code>.`;
+    console.error(err);
+  }
+})();
+
+// ---------- legend ----------
+function renderLegend(legend) {
+  const el = document.getElementById("legend");
+  // Default order matches screenshot: Published, In Development, Planned, Area
+  const fallback = [
+    { status: "green",  label: "Published" },
+    { status: "orange", label: "In Development" },
+    { status: "blue",   label: "Planned" },
+    { status: "grey",   label: "Area" }
+  ];
+  const items = (legend && legend.length ? legend : fallback)
+    .map(l => ({ status: l.status, label: l.label || STATUS_LABEL[l.status] || l.status }));
+  el.innerHTML = items.map(i =>
+    `<span class="item"><span class="swatch" style="background:${STATUS_COLOR[i.status] || '#999'}"></span>${escapeHtml(i.label)}</span>`
+  ).join("");
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"
+  }[c]));
+}
+
+// ---------- sankey rendering ----------
+function renderSankey({ nodes, links, typeOrder }) {
+  // Map nodes by name
+  const byName = new Map(nodes.map(n => [n.name, n]));
+
+  // Filter links to those whose endpoints exist as nodes
+  const validLinks = links.filter(l => byName.has(l.source) && byName.has(l.target));
+
+  // Drop nodes that have no links AND don't appear in any column position — keep
+  // every node that's in the spreadsheet so the layout matches the source of truth.
+  // (d3-sankey will assign them a column based on links; we override with typeOrder below.)
+
+  // Determine column index per node from its `type` and the typeOrder array.
+  const colIndex = new Map();
+  typeOrder.forEach((t, i) => colIndex.set(t, i));
+  const nCols = typeOrder.length;
+
+  // d3-sankey input
+  const sankeyNodes = nodes.map(n => ({ ...n }));
+  const sankeyLinks = validLinks.map(l => ({
+    source: l.source, target: l.target, value: l.value || 1
+  }));
+
+  // Layout dimensions
+  const margin = { top: 56, right: 24, bottom: 24, left: 24 };
+  // Width: target ~1700 wide content like the screenshot; allow wider on big screens.
+  const wrap = document.getElementById("chart-wrap");
+  const width  = Math.max(1500, Math.min(2000, wrap.clientWidth - 8));
+  const height = 980;
+
+  const svg = d3.select("#chart")
+    .attr("width", width)
+    .attr("height", height)
+    .attr("viewBox", `0 0 ${width} ${height}`);
+  svg.selectAll("*").remove();
+
+  // Configure sankey generator
+  const nodeWidth = 14;
+  const nodePadding = 10;
+
+  const sankey = d3.sankey()
+    .nodeId(d => d.name)
+    .nodeWidth(nodeWidth)
+    .nodePadding(nodePadding)
+    .extent([[margin.left, margin.top], [width - margin.right, height - margin.bottom]])
+    // Force column index by node type:
+    .nodeAlign(node => {
+      const idx = colIndex.has(node.type) ? colIndex.get(node.type) : 0;
+      return idx;
+    });
+
+  // Provide nodes/links objects the layout can mutate
+  const graph = sankey({
+    nodes: sankeyNodes.map(d => Object.assign({}, d)),
+    links: sankeyLinks.map(d => Object.assign({}, d))
+  });
+
+  // After layout, snap each node to its prescribed column x by overriding x0/x1
+  const colCount = nCols;
+  const innerLeft  = margin.left;
+  const innerRight = width - margin.right;
+  const colSpacing = (innerRight - innerLeft - nodeWidth) / Math.max(1, colCount - 1);
+  const colXs = d3.range(colCount).map(i => innerLeft + i * colSpacing);
+
+  graph.nodes.forEach(n => {
+    const ci = colIndex.has(n.type) ? colIndex.get(n.type) : 0;
+    n.x0 = colXs[ci];
+    n.x1 = n.x0 + nodeWidth;
+  });
+
+  // Re-run only the link path generator after x re-snapping by re-calling
+  // sankey on the updated structure with the same vertical positions preserved.
+  // Easiest: call sankey.update() which recomputes link paths from current node coords.
+  sankey.update(graph);
+
+  // Column headers
+  const headers = svg.append("g").attr("class", "col-headers");
+  typeOrder.forEach((t, i) => {
+    headers.append("text")
+      .attr("class", "col-header")
+      .attr("x", colXs[i] + nodeWidth / 2)
+      .attr("y", margin.top - 22)
+      .attr("text-anchor", "middle")
+      .text(t);
+  });
+
+  // Links (drawn first so nodes sit on top)
+  const linkLayer = svg.append("g").attr("class", "links")
+    .attr("fill", "none")
+    .attr("stroke-linecap", "butt");
+
+  const linkSel = linkLayer.selectAll("path")
+    .data(graph.links)
+    .join("path")
+      .attr("class", "link")
+      .attr("d", d3.sankeyLinkHorizontal())
+      .attr("stroke-width", d => Math.max(1, d.width));
+
+  // Nodes
+  const nodeLayer = svg.append("g").attr("class", "nodes");
+
+  const nodeG = nodeLayer.selectAll("g.node")
+    .data(graph.nodes)
+    .join("g")
+      .attr("class", "node");
+
+  nodeG.append("rect")
+    .attr("x", d => d.x0)
+    .attr("y", d => d.y0)
+    .attr("width", d => d.x1 - d.x0)
+    .attr("height", d => Math.max(2, d.y1 - d.y0))
+    .attr("fill", d => STATUS_COLOR[d.status] || "var(--status-area)")
+    .attr("rx", 1)
+    .attr("ry", 1);
+
+  // Labels: left of the rect for the first 4 columns, right of the rect for columns 5–7.
+  // The screenshot puts labels LEFT of column 1–4 and RIGHT of columns 5–7 (Mapping onward).
+  const LABEL_RIGHT_FROM_COL = 4; // 0-indexed: columns >= 4 get labels on the right
+  nodeG.append("text")
+    .attr("x", d => {
+      const ci = colIndex.has(d.type) ? colIndex.get(d.type) : 0;
+      return ci >= LABEL_RIGHT_FROM_COL ? d.x1 + 6 : d.x0 - 6;
+    })
+    .attr("y", d => (d.y0 + d.y1) / 2)
+    .attr("dy", "0.35em")
+    .attr("text-anchor", d => {
+      const ci = colIndex.has(d.type) ? colIndex.get(d.type) : 0;
+      return ci >= LABEL_RIGHT_FROM_COL ? "start" : "end";
+    })
+    .text(d => d.name);
+
+  // Invisible wider hit area over each rect so clicks/hovers are easy
+  nodeG.append("rect")
+    .attr("class", "node-hit")
+    .attr("x", d => d.x0 - 4)
+    .attr("y", d => d.y0 - 2)
+    .attr("width", d => (d.x1 - d.x0) + 8)
+    .attr("height", d => Math.max(2, d.y1 - d.y0) + 4)
+    .style("cursor", d => d.url ? "pointer" : "default")
+    .on("click", (event, d) => {
+      if (d.url) window.open(d.url, "_blank", "noopener,noreferrer");
+    })
+    .on("mouseenter", function (event, d) { highlightNode(d, event); })
+    .on("mouseleave", function () { clearHighlight(); });
+
+  // Build adjacency for highlight propagation
+  const incoming = new Map();
+  const outgoing = new Map();
+  graph.links.forEach(l => {
+    if (!incoming.has(l.target.name)) incoming.set(l.target.name, []);
+    if (!outgoing.has(l.source.name)) outgoing.set(l.source.name, []);
+    incoming.get(l.target.name).push(l);
+    outgoing.get(l.source.name).push(l);
+  });
+
+  const tooltipEl = document.getElementById("tooltip");
+
+  function highlightNode(d, event) {
+    // Find all links/nodes connected upstream and downstream
+    const visitedNodes = new Set([d.name]);
+    const visitedLinks = new Set();
+
+    function walk(name, dir) {
+      const edges = (dir === "up" ? incoming : outgoing).get(name) || [];
+      for (const l of edges) {
+        if (visitedLinks.has(l)) continue;
+        visitedLinks.add(l);
+        const next = dir === "up" ? l.source.name : l.target.name;
+        if (!visitedNodes.has(next)) {
+          visitedNodes.add(next);
+          walk(next, dir);
+        }
+      }
+    }
+    walk(d.name, "up");
+    walk(d.name, "down");
+
+    linkSel
+      .classed("highlight", l => visitedLinks.has(l))
+      .classed("dim",       l => !visitedLinks.has(l));
+    nodeG
+      .classed("dim", n => !visitedNodes.has(n.name));
+
+    // Tooltip
+    const rect = document.getElementById("chart").getBoundingClientRect();
+    tooltipEl.innerHTML =
+      `<strong>${escapeHtml(d.name)}</strong><br>` +
+      `<span style="opacity:.85">${escapeHtml(d.type || "")}${d.status ? " · " + escapeHtml(STATUS_LABEL[d.status] || d.status) : ""}</span>`;
+    tooltipEl.style.left = (event.clientX - rect.left + window.scrollX) + "px";
+    tooltipEl.style.top  = (event.clientY - rect.top  + window.scrollY) + "px";
+    tooltipEl.classList.add("visible");
+  }
+  function clearHighlight() {
+    linkSel.classed("highlight", false).classed("dim", false);
+    nodeG.classed("dim", false);
+    tooltipEl.classList.remove("visible");
+  }
+}
+</script>
+</body>
+</html>
