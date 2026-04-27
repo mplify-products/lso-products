@@ -146,12 +146,17 @@ async function loadTab(name) {
     // Normalise nodes
     const nodes = nodesRows
       .filter(r => r.name && r.name.trim())
-      .map(r => ({
-        name:   r.name.trim(),
-        type:   (r.type   || "").trim(),
-        url:    (r.url    || "").trim(),
-        status: (r.status || "").trim().toLowerCase()
-      }));
+      .map(r => {
+        const orderRaw = (r.order || r.Order || r.sort || r.Sort || "").toString().trim();
+        const orderNum = orderRaw === "" ? null : Number(orderRaw);
+        return {
+          name:   r.name.trim(),
+          type:   (r.type   || "").trim(),
+          url:    (r.url    || "").trim(),
+          status: (r.status || "").trim().toLowerCase(),
+          order:  Number.isFinite(orderNum) ? orderNum : null
+        };
+      });
 
     // Normalise links (expect columns: source, target [, value])
     // Header names may vary; accept "from"/"to" too.
@@ -271,6 +276,20 @@ function renderSankey({ nodes, links, typeOrder }) {
     .nodeAlign(node => {
       const idx = colIndex.has(node.type) ? colIndex.get(node.type) : 0;
       return idx;
+    })
+    // Vertical order within each column:
+    //  - nodes with a numeric `order` value sort FIRST, ascending (lower = higher up)
+    //  - nodes without `order` fall back to alphabetical by name (stable tiebreaker)
+    //
+    // Note: setting nodeSort replaces d3-sankey's automatic crossing-minimisation
+    // for ALL columns, not just Product. To control column N, fill in `order` for
+    // the rows of type N in the nodes sheet. Rows without an order get sunk to the
+    // bottom in alphabetical order.
+    .nodeSort((a, b) => {
+      const ao = a.order == null ? Number.POSITIVE_INFINITY : a.order;
+      const bo = b.order == null ? Number.POSITIVE_INFINITY : b.order;
+      if (ao !== bo) return ao - bo;
+      return a.name.localeCompare(b.name);
     });
 
   // Provide nodes/links objects the layout can mutate
