@@ -242,11 +242,14 @@ function renderSankey({ nodes, links, typeOrder }) {
     source: l.source, target: l.target, value: l.value || 1
   }));
 
-  // Layout dimensions
-  const margin = { top: 56, right: 24, bottom: 24, left: 24 };
+  // Layout dimensions.
+  // Generous left/right margins so labels in column 1 (left-aligned text ending
+  // at the node) and the last column (right-aligned text starting at the node)
+  // have room to breathe and never clip.
+  const margin = { top: 56, right: 220, bottom: 24, left: 220 };
   // Width: target ~1700 wide content like the screenshot; allow wider on big screens.
   const wrap = document.getElementById("chart-wrap");
-  const width  = Math.max(1500, Math.min(2000, wrap.clientWidth - 8));
+  const width  = Math.max(1700, Math.min(2200, wrap.clientWidth - 8));
   const height = 980;
 
   const svg = d3.select("#chart")
