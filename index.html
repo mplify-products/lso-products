@@ -31,10 +31,12 @@
   #chart-wrap { width: 100%; overflow-x: auto; }
   svg { display: block; }
   .col-header { font-size: 13px; font-weight: 500; fill: var(--column-header); }
-  .help-icon circle { transition: fill 120ms ease, stroke 120ms ease; }
-  .help-icon:hover circle, .help-icon:focus circle { fill: #f1f3f4; stroke: #5f6368; }
+  .help-icon circle, .help-icon rect { transition: fill 120ms ease, stroke 120ms ease; }
+  .help-icon:hover > circle:first-child, .help-icon:focus > circle:first-child { fill: #f1f3f4; stroke: #5f6368; }
+  .help-icon:hover .info-tittle, .help-icon:hover .info-stem,
+  .help-icon:focus .info-tittle, .help-icon:focus .info-stem { fill: #202124; }
   .help-icon:focus { outline: none; }
-  .help-icon:focus-visible circle { stroke: var(--status-planned); stroke-width: 1.5; }
+  .help-icon:focus-visible > circle:first-child { stroke: var(--status-planned); stroke-width: 1.5; }
   .node rect { cursor: pointer; transition: opacity 120ms ease; }
   .node text { font-size: 12px; fill: var(--text); pointer-events: none; }
   .node a { cursor: pointer; }
@@ -48,7 +50,7 @@
   .link.highlight { stroke: var(--link-fill-highlight); stroke-opacity: 0.95; }
   .node-hit { cursor: pointer; fill: transparent; }
   #error { color: #b00020; padding: 16px 0; font-size: 13px; }
-  .tooltip { position: absolute; pointer-events: none; background: rgba(32,33,36,0.95); color: #fff; padding: 8px 12px; border-radius: 4px; font-size: 12px; line-height: 1.4; transform: translate(-50%, -120%); max-width: 320px; opacity: 0; transition: opacity 100ms ease; box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
+  .tooltip { position: fixed; pointer-events: none; background: rgba(32,33,36,0.95); color: #fff; padding: 8px 12px; border-radius: 4px; font-size: 12px; line-height: 1.4; transform: translate(-50%, calc(-100% - 10px)); max-width: 320px; opacity: 0; transition: opacity 100ms ease; box-shadow: 0 2px 8px rgba(0,0,0,0.15); z-index: 1000; }
   .tooltip.visible { opacity: 1; }
   @media (max-width: 900px) { h1 { font-size: 22px; } #legend { position: static; margin-top: 8px; flex-wrap: wrap; } }
 </style>
@@ -397,34 +399,37 @@ function renderSankey({ nodes, links, typeOrder, typeHelp }) {
         .attr("stroke", "#9aa0a6")
         .attr("stroke-width", 1);
 
-      helpIcon.append("text")
-        .attr("text-anchor", "middle")
-        .attr("dy", "0.35em")
-        .attr("font-size", "10px")
-        .attr("font-weight", "600")
+      // Info-style "i" glyph: a small dot (tittle) above a short vertical bar (stem).
+      // Drawn with primitives so it stays crisp at 14px.
+      helpIcon.append("circle")
+        .attr("class", "info-tittle")
+        .attr("cx", 0).attr("cy", -3)
+        .attr("r", 1)
         .attr("fill", "#5f6368")
-        .style("pointer-events", "none")
-        .style("user-select", "none")
-        .text("?");
+        .style("pointer-events", "none");
+
+      helpIcon.append("rect")
+        .attr("class", "info-stem")
+        .attr("x", -0.75).attr("y", -1)
+        .attr("width", 1.5).attr("height", 5)
+        .attr("rx", 0.5)
+        .attr("fill", "#5f6368")
+        .style("pointer-events", "none");
 
       // Hover and focus → show tooltip with help text.
       // Tap (touch/click) → toggle tooltip; tapping outside dismisses (handled above).
-      const showHelpTooltip = (event) => {
-        const rect = document.getElementById("chart").getBoundingClientRect();
+      // The tooltip is anchored to the icon's own position (not the cursor) so it
+      // appears reliably right next to the icon regardless of how the user got there.
+      const showHelpTooltip = () => {
+        const iconRect = helpIcon.node().getBoundingClientRect();
         tooltipEl.innerHTML =
           `<strong>${escapeHtml(t)}</strong>` +
           `<div style="margin-top:4px; line-height:1.45; opacity:.95">${escapeHtml(help)}</div>`;
-        // Position tooltip near the icon. Use clientX/Y if available (mouse/touch),
-        // otherwise fall back to the icon's screen position (keyboard focus case).
-        let x, y;
-        if (event && typeof event.clientX === "number" && event.clientX !== 0) {
-          x = event.clientX - rect.left + window.scrollX;
-          y = event.clientY - rect.top  + window.scrollY;
-        } else {
-          const iconRect = helpIcon.node().getBoundingClientRect();
-          x = iconRect.left + iconRect.width / 2 - rect.left + window.scrollX;
-          y = iconRect.top - rect.top + window.scrollY;
-        }
+        // With position: fixed, left/top are viewport coordinates. Center horizontally
+        // on the icon; the CSS transform pulls the tooltip up so its bottom edge sits
+        // 10px above the icon's top edge.
+        const x = iconRect.left + iconRect.width / 2;
+        const y = iconRect.top;
         tooltipEl.style.left = x + "px";
         tooltipEl.style.top  = y + "px";
         tooltipEl.classList.add("visible");
@@ -449,7 +454,7 @@ function renderSankey({ nodes, links, typeOrder, typeHelp }) {
             tooltipEl.classList.remove("visible");
           } else {
             pinnedHelpIcon = this;
-            showHelpTooltip(event);
+            showHelpTooltip();
           }
         });
     }
@@ -581,8 +586,7 @@ function renderSankey({ nodes, links, typeOrder, typeHelp }) {
     nodeG
       .classed("dim", n => !visitedNodes.has(n.name));
 
-    // Tooltip
-    const rect = document.getElementById("chart").getBoundingClientRect();
+    // Tooltip — viewport coordinates (position: fixed)
     const statusText = d.status ? " · " + escapeHtml(STATUS_LABEL[d.status] || d.status) : "";
     const urlLine = d.url
       ? `<br><span style="opacity:.7; font-size:11px">↗ Click to open · ${escapeHtml(truncateUrl(d.url, 60))}</span>`
@@ -591,8 +595,8 @@ function renderSankey({ nodes, links, typeOrder, typeHelp }) {
       `<strong>${escapeHtml(d.name)}</strong><br>` +
       `<span style="opacity:.85">${escapeHtml(d.type || "")}${statusText}</span>` +
       urlLine;
-    tooltipEl.style.left = (event.clientX - rect.left + window.scrollX) + "px";
-    tooltipEl.style.top  = (event.clientY - rect.top  + window.scrollY) + "px";
+    tooltipEl.style.left = event.clientX + "px";
+    tooltipEl.style.top  = event.clientY + "px";
     tooltipEl.classList.add("visible");
   }
   function clearHighlight() {
