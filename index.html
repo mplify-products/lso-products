@@ -206,10 +206,43 @@ async function loadTab(name) {
     const typeHelp = new Map(typeOrderEntries.map(e => [e.type, e.help]));
 
     // legend (optional): columns like status, label
+    // Legend: maps a status (colour key) to its display label.
+    // Accepts a range of column names so the sheet author can use whichever
+    // naming feels natural: status/color/colour for the key, label/name/text
+    // for the display string. Status values are normalised to lowercase to
+    // match the STATUS_COLOR/STATUS_LABEL maps.
+    const pickField = (row, candidates) => {
+      for (const k of candidates) {
+        if (row[k] != null && String(row[k]).trim() !== "") return String(row[k]);
+      }
+      // Case-insensitive fallback in case the user capitalised differently
+      const lower = candidates.map(c => c.toLowerCase());
+      for (const key of Object.keys(row)) {
+        if (lower.includes(key.toLowerCase()) && row[key] != null && String(row[key]).trim() !== "") {
+          return String(row[key]);
+        }
+      }
+      return "";
+    };
     const legend = (legendRows || []).map(r => ({
-      status: (r.status || r.Status || "").toString().trim().toLowerCase(),
-      label:  (r.label  || r.Label  || "").toString().trim()
+      status: pickField(r, ["status", "color", "colour", "key"]).trim().toLowerCase(),
+      label:  pickField(r, ["label", "name", "text", "display"]).trim()
     })).filter(l => l.status);
+
+    if (!legend.length && legendRows && legendRows.length) {
+      console.warn(
+        "Legend tab loaded but no rows could be parsed. " +
+        "Expected columns named 'status' (or 'color'/'colour') and 'label' (or 'name'/'text'). " +
+        "Found columns:", Object.keys(legendRows[0])
+      );
+    }
+
+    // Let the legend tab override the default status labels everywhere
+    // (including node hover tooltips). Anything not specified in the tab keeps
+    // its hardcoded default.
+    legend.forEach(l => {
+      if (l.label) STATUS_LABEL[l.status] = l.label;
+    });
 
     renderLegend(legend);
     renderSankey({ nodes, links, typeOrder, typeHelp });
@@ -391,7 +424,7 @@ function renderSankey({ nodes, links, typeOrder, typeHelp }) {
         .attr("tabindex", 0)
         .attr("role", "button")
         .attr("aria-label", `Help: ${t}`)
-        .style("cursor", "help");
+        .style("cursor", "pointer");
 
       helpIcon.append("circle")
         .attr("r", iconR)
