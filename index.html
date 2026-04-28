@@ -31,6 +31,10 @@
   #chart-wrap { width: 100%; overflow-x: auto; }
   svg { display: block; }
   .col-header { font-size: 13px; font-weight: 500; fill: var(--column-header); }
+  .help-icon circle { transition: fill 120ms ease, stroke 120ms ease; }
+  .help-icon:hover circle, .help-icon:focus circle { fill: #f1f3f4; stroke: #5f6368; }
+  .help-icon:focus { outline: none; }
+  .help-icon:focus-visible circle { stroke: var(--status-planned); stroke-width: 1.5; }
   .node rect { cursor: pointer; transition: opacity 120ms ease; }
   .node text { font-size: 12px; fill: var(--text); pointer-events: none; }
   .node a { cursor: pointer; }
@@ -44,7 +48,7 @@
   .link.highlight { stroke: var(--link-fill-highlight); stroke-opacity: 0.95; }
   .node-hit { cursor: pointer; fill: transparent; }
   #error { color: #b00020; padding: 16px 0; font-size: 13px; }
-  .tooltip { position: absolute; pointer-events: none; background: rgba(32,33,36,0.95); color: #fff; padding: 6px 10px; border-radius: 4px; font-size: 12px; line-height: 1.4; transform: translate(-50%, -120%); white-space: nowrap; opacity: 0; transition: opacity 100ms ease; }
+  .tooltip { position: absolute; pointer-events: none; background: rgba(32,33,36,0.95); color: #fff; padding: 8px 12px; border-radius: 4px; font-size: 12px; line-height: 1.4; transform: translate(-50%, -120%); max-width: 320px; opacity: 0; transition: opacity 100ms ease; box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
   .tooltip.visible { opacity: 1; }
   @media (max-width: 900px) { h1 { font-size: 22px; } #legend { position: static; margin-top: 8px; flex-wrap: wrap; } }
 </style>
@@ -177,15 +181,27 @@ async function loadTab(name) {
       }))
       .filter(l => l.source && l.target);
 
-    // type_order: ordered list of column types (column = "type" or single column with header).
-    // Accept either a single-column list or an explicit "type" column.
-    const orderCol = (() => {
+    // type_order: ordered list of column types with optional help text.
+    // Expected columns: `type` (the column name) and optionally `help` (the
+    // tooltip text). Falls back to a single-column list if `type` isn't
+    // present, or to the unique types found on nodes if the tab is empty.
+    const typeOrderEntries = (() => {
       if (!typeOrderRows.length) return [];
       const headers = Object.keys(typeOrderRows[0]);
-      const preferred = headers.find(h => /^type/i.test(h)) || headers[0];
-      return typeOrderRows.map(r => (r[preferred] || "").trim()).filter(Boolean);
+      const typeKey = headers.find(h => /^type$/i.test(h)) || headers[0];
+      const helpKey = headers.find(h => /^help$/i.test(h)) ||
+                      headers.find(h => /^(description|tooltip|info)$/i.test(h));
+      return typeOrderRows
+        .map(r => ({
+          type: (r[typeKey] || "").toString().trim(),
+          help: helpKey ? (r[helpKey] || "").toString().trim() : ""
+        }))
+        .filter(e => e.type);
     })();
-    const typeOrder = orderCol.length ? orderCol : Array.from(new Set(nodes.map(n => n.type)));
+    const typeOrder = typeOrderEntries.length
+      ? typeOrderEntries.map(e => e.type)
+      : Array.from(new Set(nodes.map(n => n.type)));
+    const typeHelp = new Map(typeOrderEntries.map(e => [e.type, e.help]));
 
     // legend (optional): columns like status, label
     const legend = (legendRows || []).map(r => ({
@@ -194,7 +210,7 @@ async function loadTab(name) {
     })).filter(l => l.status);
 
     renderLegend(legend);
-    renderSankey({ nodes, links, typeOrder });
+    renderSankey({ nodes, links, typeOrder, typeHelp });
   } catch (err) {
     statusEl.textContent = "";
     errorEl.innerHTML =
@@ -239,7 +255,8 @@ function truncateUrl(url, maxLen) {
 }
 
 // ---------- sankey rendering ----------
-function renderSankey({ nodes, links, typeOrder }) {
+function renderSankey({ nodes, links, typeOrder, typeHelp }) {
+  const tooltipEl = document.getElementById("tooltip");
   // Map nodes by name
   const byName = new Map(nodes.map(n => [n.name, n]));
 
@@ -330,15 +347,112 @@ function renderSankey({ nodes, links, typeOrder }) {
   // Easiest: call sankey.update() which recomputes link paths from current node coords.
   sankey.update(graph);
 
-  // Column headers
+  // Column headers: title text + (?) help icon (when help text exists for that type).
   const headers = svg.append("g").attr("class", "col-headers");
+
+  // Pinned-help-icon state: which icon is currently held open by tap (mobile UX).
+  // Mouse hover/blur do not interact with this — they show/hide the tooltip directly.
+  let pinnedHelpIcon = null;
+  // Tap anywhere outside a pinned help icon dismisses the help tooltip.
+  document.addEventListener("click", () => {
+    if (pinnedHelpIcon) {
+      pinnedHelpIcon = null;
+      tooltipEl.classList.remove("visible");
+    }
+  });
+
   typeOrder.forEach((t, i) => {
-    headers.append("text")
+    const help = typeHelp && typeHelp.get(t);
+    const cx = colXs[i] + nodeWidth / 2;
+    const headerY = margin.top - 22;
+
+    const headerGroup = headers.append("g")
+      .attr("class", "col-header-group")
+      .attr("transform", `translate(${cx}, ${headerY})`);
+
+    const titleText = headerGroup.append("text")
       .attr("class", "col-header")
-      .attr("x", colXs[i] + nodeWidth / 2)
-      .attr("y", margin.top - 22)
       .attr("text-anchor", "middle")
+      .attr("dy", "0")
       .text(t);
+
+    if (help) {
+      // Measure the title to position the (?) icon just to the right of it.
+      // getBBox() works because the element is already in the DOM at this point.
+      const bbox = titleText.node().getBBox();
+      const iconX = bbox.width / 2 + 10; // 10px gap from end of title
+      const iconR = 7;
+
+      const helpIcon = headerGroup.append("g")
+        .attr("class", "help-icon")
+        .attr("transform", `translate(${iconX}, -4)`)
+        .attr("tabindex", 0)
+        .attr("role", "button")
+        .attr("aria-label", `Help: ${t}`)
+        .style("cursor", "help");
+
+      helpIcon.append("circle")
+        .attr("r", iconR)
+        .attr("fill", "#fff")
+        .attr("stroke", "#9aa0a6")
+        .attr("stroke-width", 1);
+
+      helpIcon.append("text")
+        .attr("text-anchor", "middle")
+        .attr("dy", "0.35em")
+        .attr("font-size", "10px")
+        .attr("font-weight", "600")
+        .attr("fill", "#5f6368")
+        .style("pointer-events", "none")
+        .style("user-select", "none")
+        .text("?");
+
+      // Hover and focus → show tooltip with help text.
+      // Tap (touch/click) → toggle tooltip; tapping outside dismisses (handled above).
+      const showHelpTooltip = (event) => {
+        const rect = document.getElementById("chart").getBoundingClientRect();
+        tooltipEl.innerHTML =
+          `<strong>${escapeHtml(t)}</strong>` +
+          `<div style="margin-top:4px; line-height:1.45; opacity:.95">${escapeHtml(help)}</div>`;
+        // Position tooltip near the icon. Use clientX/Y if available (mouse/touch),
+        // otherwise fall back to the icon's screen position (keyboard focus case).
+        let x, y;
+        if (event && typeof event.clientX === "number" && event.clientX !== 0) {
+          x = event.clientX - rect.left + window.scrollX;
+          y = event.clientY - rect.top  + window.scrollY;
+        } else {
+          const iconRect = helpIcon.node().getBoundingClientRect();
+          x = iconRect.left + iconRect.width / 2 - rect.left + window.scrollX;
+          y = iconRect.top - rect.top + window.scrollY;
+        }
+        tooltipEl.style.left = x + "px";
+        tooltipEl.style.top  = y + "px";
+        tooltipEl.classList.add("visible");
+      };
+      const hideHelpTooltip = () => {
+        // Don't hide if this icon is currently pinned open by a tap.
+        if (pinnedHelpIcon === helpIcon.node()) return;
+        tooltipEl.classList.remove("visible");
+      };
+
+      helpIcon
+        .on("mouseenter", showHelpTooltip)
+        .on("mouseleave", hideHelpTooltip)
+        .on("focus", showHelpTooltip)
+        .on("blur", hideHelpTooltip)
+        // Click toggles the pinned state. Stop propagation so the document-level
+        // dismiss handler doesn't fire on the same click that opens it.
+        .on("click", function (event) {
+          event.stopPropagation();
+          if (pinnedHelpIcon === this) {
+            pinnedHelpIcon = null;
+            tooltipEl.classList.remove("visible");
+          } else {
+            pinnedHelpIcon = this;
+            showHelpTooltip(event);
+          }
+        });
+    }
   });
 
   // Links (drawn first so nodes sit on top)
@@ -440,8 +554,6 @@ function renderSankey({ nodes, links, typeOrder }) {
     incoming.get(l.target.name).push(l);
     outgoing.get(l.source.name).push(l);
   });
-
-  const tooltipEl = document.getElementById("tooltip");
 
   function highlightNode(d, event) {
     // Find all links/nodes connected upstream and downstream
