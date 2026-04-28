@@ -33,6 +33,11 @@
   .col-header { font-size: 13px; font-weight: 500; fill: var(--column-header); }
   .node rect { cursor: pointer; transition: opacity 120ms ease; }
   .node text { font-size: 12px; fill: var(--text); pointer-events: none; }
+  .node a { cursor: pointer; }
+  .node a text { pointer-events: auto; }
+  .node a:hover text { text-decoration: underline; }
+  .node a:focus { outline: none; }
+  .node a:focus-visible text { text-decoration: underline; outline: 2px solid var(--status-planned); outline-offset: 2px; border-radius: 2px; }
   .node.dim rect, .node.dim text { opacity: 0.25; }
   .link { fill: none; stroke: var(--link-fill); stroke-opacity: 0.6; transition: stroke 120ms ease, stroke-opacity 120ms ease; }
   .link.dim { stroke: var(--link-fill-faded); stroke-opacity: 0.4; }
@@ -224,6 +229,15 @@ function escapeHtml(s) {
   }[c]));
 }
 
+// Compact a URL for display in the tooltip (max ~maxLen chars). Strips protocol
+// and query strings, and adds an ellipsis if still over budget.
+function truncateUrl(url, maxLen) {
+  if (!url) return "";
+  let s = url.replace(/^https?:\/\//, "").replace(/\?.*$/, "");
+  if (s.length > maxLen) s = s.slice(0, maxLen - 1) + "…";
+  return s;
+}
+
 // ---------- sankey rendering ----------
 function renderSankey({ nodes, links, typeOrder }) {
   // Map nodes by name
@@ -359,18 +373,46 @@ function renderSankey({ nodes, links, typeOrder }) {
   // Labels: left of the rect for the first 4 columns, right of the rect for columns 5–7.
   // The screenshot puts labels LEFT of column 1–4 and RIGHT of columns 5–7 (Mapping onward).
   const LABEL_RIGHT_FROM_COL = 4; // 0-indexed: columns >= 4 get labels on the right
-  nodeG.append("text")
-    .attr("x", d => {
-      const ci = colIndex.has(d.type) ? colIndex.get(d.type) : 0;
-      return ci >= LABEL_RIGHT_FROM_COL ? d.x1 + 6 : d.x0 - 6;
-    })
-    .attr("y", d => (d.y0 + d.y1) / 2)
-    .attr("dy", "0.35em")
-    .attr("text-anchor", d => {
-      const ci = colIndex.has(d.type) ? colIndex.get(d.type) : 0;
-      return ci >= LABEL_RIGHT_FROM_COL ? "start" : "end";
-    })
-    .text(d => d.name);
+  const labelX = d => {
+    const ci = colIndex.has(d.type) ? colIndex.get(d.type) : 0;
+    return ci >= LABEL_RIGHT_FROM_COL ? d.x1 + 6 : d.x0 - 6;
+  };
+  const labelAnchor = d => {
+    const ci = colIndex.has(d.type) ? colIndex.get(d.type) : 0;
+    return ci >= LABEL_RIGHT_FROM_COL ? "start" : "end";
+  };
+
+  // For nodes WITH a url, wrap the label in an SVG <a>; for nodes without, plain <text>.
+  // We also propagate hover/click events from the link into the same highlight pipeline
+  // used by the rect-hit-area, so hovering a label highlights its flow.
+  nodeG.each(function (d) {
+    const g = d3.select(this);
+    const x = labelX(d);
+    const y = (d.y0 + d.y1) / 2;
+    const anchor = labelAnchor(d);
+    if (d.url) {
+      const a = g.append("a")
+        .attr("href", d.url)
+        .attr("target", "_blank")
+        .attr("rel", "noopener noreferrer")
+        // Tooltip-style title: native browser tooltip as a fallback (e.g. when JS tooltip is off-screen).
+        .attr("aria-label", `${d.name} — opens in a new tab`);
+      a.append("text")
+        .attr("x", x).attr("y", y).attr("dy", "0.35em")
+        .attr("text-anchor", anchor)
+        .text(d.name);
+      a.on("mouseenter", function (event) { highlightNode(d, event); })
+       .on("mouseleave", function () { clearHighlight(); })
+       // Clear highlight on click too — the new tab opens but mouseleave may not fire on the
+       // current page reliably, so explicitly reset state.
+       .on("click", function () { clearHighlight(); });
+    } else {
+      g.append("text")
+        .attr("x", x).attr("y", y).attr("dy", "0.35em")
+        .attr("text-anchor", anchor)
+        .text(d.name);
+    }
+  });
 
   // Invisible wider hit area over each rect so clicks/hovers are easy
   nodeG.append("rect")
@@ -381,7 +423,10 @@ function renderSankey({ nodes, links, typeOrder }) {
     .attr("height", d => Math.max(2, d.y1 - d.y0) + 4)
     .style("cursor", d => d.url ? "pointer" : "default")
     .on("click", (event, d) => {
-      if (d.url) window.open(d.url, "_blank", "noopener,noreferrer");
+      if (d.url) {
+        clearHighlight();
+        window.open(d.url, "_blank", "noopener,noreferrer");
+      }
     })
     .on("mouseenter", function (event, d) { highlightNode(d, event); })
     .on("mouseleave", function () { clearHighlight(); });
@@ -426,9 +471,14 @@ function renderSankey({ nodes, links, typeOrder }) {
 
     // Tooltip
     const rect = document.getElementById("chart").getBoundingClientRect();
+    const statusText = d.status ? " · " + escapeHtml(STATUS_LABEL[d.status] || d.status) : "";
+    const urlLine = d.url
+      ? `<br><span style="opacity:.7; font-size:11px">↗ Click to open · ${escapeHtml(truncateUrl(d.url, 60))}</span>`
+      : "";
     tooltipEl.innerHTML =
       `<strong>${escapeHtml(d.name)}</strong><br>` +
-      `<span style="opacity:.85">${escapeHtml(d.type || "")}${d.status ? " · " + escapeHtml(STATUS_LABEL[d.status] || d.status) : ""}</span>`;
+      `<span style="opacity:.85">${escapeHtml(d.type || "")}${statusText}</span>` +
+      urlLine;
     tooltipEl.style.left = (event.clientX - rect.left + window.scrollX) + "px";
     tooltipEl.style.top  = (event.clientY - rect.top  + window.scrollY) + "px";
     tooltipEl.classList.add("visible");
