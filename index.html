@@ -29,6 +29,7 @@
   #legend .item { display: flex; align-items: center; gap: 6px; }
   #legend .swatch { width: 14px; height: 14px; border-radius: 2px; display: inline-block; }
   #status { padding: 16px 0; color: var(--text-muted); font-size: 13px; }
+  #status:empty { padding: 0; }
   #chart-wrap { width: 100%; }
   svg { display: block; }
   .col-header { font-size: 13px; font-weight: 500; fill: var(--column-header); }
@@ -374,7 +375,9 @@ function renderSankey({ nodes, links, typeOrder, typeHelp }) {
   const MAX_INTERNAL_WIDTH = 2200; // above this, we cap to avoid stretching too wide
 
   // Generous left/right margins so labels in the first/last columns don't clip.
-  const margin = { top: 56, right: 220, bottom: 24, left: 220 };
+  // Top margin is intentionally tight — the column headers sit at margin.top - 22,
+  // so this controls the gap between the page title and the header row.
+  const margin = { top: 36, right: 220, bottom: 24, left: 220 };
 
   const wrap = document.getElementById("chart-wrap");
   const containerWidth = wrap.clientWidth || window.innerWidth;
