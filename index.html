@@ -23,12 +23,13 @@
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; -webkit-font-smoothing: antialiased; }
   #app { width: 100vw; min-height: 100vh; padding: 24px 32px; position: relative; }
+  @media (max-width: 900px) { #app { padding: 16px 12px; } }
   h1 { font-size: 28px; font-weight: 500; margin: 0 0 8px 0; letter-spacing: -0.01em; }
   #legend { position: absolute; top: 28px; right: 32px; display: flex; gap: 18px; font-size: 12px; color: var(--text); }
   #legend .item { display: flex; align-items: center; gap: 6px; }
   #legend .swatch { width: 14px; height: 14px; border-radius: 2px; display: inline-block; }
   #status { padding: 16px 0; color: var(--text-muted); font-size: 13px; }
-  #chart-wrap { width: 100%; overflow-x: auto; }
+  #chart-wrap { width: 100%; }
   svg { display: block; }
   .col-header { font-size: 13px; font-weight: 500; fill: var(--column-header); }
   .help-icon circle, .help-icon rect { transition: fill 120ms ease, stroke 120ms ease; }
@@ -245,7 +246,36 @@ async function loadTab(name) {
     });
 
     renderLegend(legend);
-    renderSankey({ nodes, links, typeOrder, typeHelp });
+
+    // Initial render. We re-call this on iframe resize so layout adapts.
+    let redrawScheduled = false;
+    function redraw() {
+      renderSankey({ nodes, links, typeOrder, typeHelp });
+      // After layout settles, tell the parent (if any) what total height the
+      // content needs. Use rAF to ensure the DOM has applied all measurements.
+      requestAnimationFrame(() => requestAnimationFrame(reportHeightToParent));
+    }
+    function scheduleRedraw() {
+      if (redrawScheduled) return;
+      redrawScheduled = true;
+      requestAnimationFrame(() => {
+        redrawScheduled = false;
+        redraw();
+      });
+    }
+    redraw();
+
+    // Watch the chart wrap for size changes (iframe resize, parent layout
+    // changes, devtools opening, etc.) and redraw to fit.
+    if (typeof ResizeObserver !== "undefined") {
+      const ro = new ResizeObserver(() => scheduleRedraw());
+      ro.observe(document.getElementById("chart-wrap"));
+    } else {
+      window.addEventListener("resize", scheduleRedraw);
+    }
+    // Also report height on plain window resize (covers fonts loading, scrollbar
+    // appearing, etc.).
+    window.addEventListener("resize", reportHeightToParent);
   } catch (err) {
     statusEl.textContent = "";
     errorEl.innerHTML =
@@ -278,6 +308,29 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({
     "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"
   }[c]));
+}
+
+// ---- iframe auto-height bridge ----
+// When this page is embedded in an iframe, post the current content height
+// to the parent so the parent can resize the iframe to match. The parent
+// must opt in by listening for messages of type "lso-sankey:height".
+//
+// Parent-side glue (paste into the parent page once):
+//   window.addEventListener("message", (e) => {
+//     if (e.data && e.data.type === "lso-sankey:height") {
+//       const iframe = document.querySelector("iframe[data-lso-sankey]");
+//       if (iframe) iframe.style.height = e.data.height + "px";
+//     }
+//   });
+// And mark the iframe with `data-lso-sankey` (or use whatever selector you prefer).
+function reportHeightToParent() {
+  if (window.parent === window) return; // not in an iframe
+  // scrollHeight is the most reliable measure of "what does the content need".
+  // Add a tiny buffer for sub-pixel rounding so the parent never clips.
+  const h = Math.ceil(document.documentElement.scrollHeight) + 2;
+  try {
+    window.parent.postMessage({ type: "lso-sankey:height", height: h }, "*");
+  } catch (e) { /* cross-origin restrictions — ignore */ }
 }
 
 // Compact a URL for display in the tooltip (max ~maxLen chars). Strips protocol
@@ -314,19 +367,44 @@ function renderSankey({ nodes, links, typeOrder, typeHelp }) {
   }));
 
   // Layout dimensions.
-  // Generous left/right margins so labels in column 1 (left-aligned text ending
-  // at the node) and the last column (right-aligned text starting at the node)
-  // have room to breathe and never clip.
+  // Strategy: fluid layout when there's enough room, scale-to-fit below the
+  // readability threshold (MIN_INTERNAL_WIDTH). Height is computed from the
+  // tallest column so columns are never starved of vertical space.
+  const MIN_INTERNAL_WIDTH = 1400; // below this, we render at 1400 internal and CSS-scale down
+  const MAX_INTERNAL_WIDTH = 2200; // above this, we cap to avoid stretching too wide
+
+  // Generous left/right margins so labels in the first/last columns don't clip.
   const margin = { top: 56, right: 220, bottom: 24, left: 220 };
-  // Width: target ~1700 wide content like the screenshot; allow wider on big screens.
+
   const wrap = document.getElementById("chart-wrap");
-  const width  = Math.max(1700, Math.min(2200, wrap.clientWidth - 8));
-  const height = 980;
+  const containerWidth = wrap.clientWidth || window.innerWidth;
+
+  // Internal SVG width: what we *render at*. Always between MIN and MAX.
+  // If the iframe is narrower than MIN, we still render at MIN and let CSS scale us down.
+  const internalWidth = Math.max(MIN_INTERNAL_WIDTH, Math.min(MAX_INTERNAL_WIDTH, containerWidth));
+
+  // Compute height from content: take the column with the most nodes and give
+  // each node ~22px (rect + padding). Add margins. Clamped so very sparse
+  // diagrams aren't tiny and very dense ones don't blow past readable.
+  const nodesPerCol = new Map();
+  nodes.forEach(n => nodesPerCol.set(n.type, (nodesPerCol.get(n.type) || 0) + 1));
+  const maxNodesInACol = Math.max(1, ...nodesPerCol.values());
+  const PER_NODE_HEIGHT = 22; // approximate vertical room each node consumes
+  const innerHeight = Math.max(600, Math.min(1400, maxNodesInACol * PER_NODE_HEIGHT));
+  const internalHeight = innerHeight + margin.top + margin.bottom;
+
+  const width  = internalWidth;
+  const height = internalHeight;
 
   const svg = d3.select("#chart")
-    .attr("width", width)
-    .attr("height", height)
-    .attr("viewBox", `0 0 ${width} ${height}`);
+    // viewBox carries the internal coordinate system; the SVG element resizes
+    // fluidly via CSS to fit the iframe, scaling everything proportionally.
+    .attr("viewBox", `0 0 ${width} ${height}`)
+    .attr("preserveAspectRatio", "xMidYMid meet")
+    .style("width", "100%")
+    .style("height", "auto")
+    .style("max-width", `${MAX_INTERNAL_WIDTH}px`)
+    .style("display", "block");
   svg.selectAll("*").remove();
 
   // Configure sankey generator
@@ -386,15 +464,18 @@ function renderSankey({ nodes, links, typeOrder, typeHelp }) {
   const headers = svg.append("g").attr("class", "col-headers");
 
   // Pinned-help-icon state: which icon is currently held open by tap (mobile UX).
-  // Mouse hover/blur do not interact with this — they show/hide the tooltip directly.
-  let pinnedHelpIcon = null;
-  // Tap anywhere outside a pinned help icon dismisses the help tooltip.
-  document.addEventListener("click", () => {
-    if (pinnedHelpIcon) {
-      pinnedHelpIcon = null;
-      tooltipEl.classList.remove("visible");
-    }
-  });
+  // Stored on `window` so the (idempotent) document-level dismiss handler can
+  // clear it cleanly across redraws without leaking listeners.
+  if (!window.__lsoSankeyDocClickAttached) {
+    document.addEventListener("click", () => {
+      if (window.__lsoSankeyPinned) {
+        window.__lsoSankeyPinned = null;
+        document.getElementById("tooltip").classList.remove("visible");
+      }
+    });
+    window.__lsoSankeyDocClickAttached = true;
+  }
+  window.__lsoSankeyPinned = null;
 
   typeOrder.forEach((t, i) => {
     const help = typeHelp && typeHelp.get(t);
@@ -469,7 +550,7 @@ function renderSankey({ nodes, links, typeOrder, typeHelp }) {
       };
       const hideHelpTooltip = () => {
         // Don't hide if this icon is currently pinned open by a tap.
-        if (pinnedHelpIcon === helpIcon.node()) return;
+        if (window.__lsoSankeyPinned === helpIcon.node()) return;
         tooltipEl.classList.remove("visible");
       };
 
@@ -482,11 +563,11 @@ function renderSankey({ nodes, links, typeOrder, typeHelp }) {
         // dismiss handler doesn't fire on the same click that opens it.
         .on("click", function (event) {
           event.stopPropagation();
-          if (pinnedHelpIcon === this) {
-            pinnedHelpIcon = null;
+          if (window.__lsoSankeyPinned === this) {
+            window.__lsoSankeyPinned = null;
             tooltipEl.classList.remove("visible");
           } else {
-            pinnedHelpIcon = this;
+            window.__lsoSankeyPinned = this;
             showHelpTooltip();
           }
         });
