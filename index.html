@@ -416,10 +416,9 @@ function renderSankey({ nodes, links, typeOrder, typeHelp }) {
   // Right margin reserves room for rotated-row headers ("Service Schema", etc.)
   // when the bend is active. Without the bend, the original 220px is enough for
   // long node labels in the last column.
-  // Bottom margin reserves room for rotated 90° labels under the BOTTOM rotated
-  // row — the longest names ("Wavelength (L0) service attributes" etc.) extend
-  // ~200px below the slab when rotated, so we need a generous bottom margin.
-  const margin = { top: 36, right: 260, bottom: 220, left: 220 };
+  // Bottom margin is small because all rotated labels now sit ABOVE their slabs;
+  // nothing extends below the bottom row's slab.
+  const margin = { top: 36, right: 260, bottom: 40, left: 220 };
 
   const wrap = document.getElementById("chart-wrap");
   const containerWidth = wrap.clientWidth || window.innerWidth;
@@ -475,14 +474,16 @@ function renderSankey({ nodes, links, typeOrder, typeHelp }) {
 
   // Vertical region: need room for vCols rows. Each row is one "column" of nodes (after rotation).
   // Add inter-row spacing so the rotated labels for each row have room to breathe.
-  // Labels are rotated 90° and placed above each row (or below, for the bottom row),
-  // so VROW_SPACING needs to fit the longest label plus padding.
-  const VROW_SPACING = 160; // vertical distance between successive rotated-column rows
+  // Labels are rotated 90° and placed above each row, so VROW_SPACING needs to fit
+  // the longest label plus padding.
+  const VROW_SPACING = 200; // vertical distance between successive rotated-column rows
   const verticalRegionHeight = hasBend ? (vCols.length * VROW_SPACING + 80) : 0;
-  // Headroom above the FIRST rotated row's slabs, so the row's rotated 90° labels
-  // (which extend upward from the slab) have clear space and don't collide with
-  // the horizontal-region column headers up at margin.top - 22.
-  const VROW_SPACING_TOP_PAD = hasBend ? 130 : 0;
+  // Headroom above the FIRST rotated row's slabs. This is where the bridge bands
+  // curve down from the horizontal region into the top of the rotated region —
+  // the larger this is, the more graceful the bridge curl, and the further down
+  // the page the rotated section starts. Also needs enough room for the FIRST
+  // rotated row's labels (which sit above the slab, between the bridge and the slab).
+  const VROW_SPACING_TOP_PAD = hasBend ? 280 : 0;
 
   const innerHeight = hasBend
     ? Math.max(horizontalRegionHeight, VROW_SPACING_TOP_PAD + verticalRegionHeight) + 30
@@ -1078,45 +1079,24 @@ function renderSankey({ nodes, links, typeOrder, typeHelp }) {
   // For ROTATED nodes (vCols, post-rotation), nodes are wide horizontal slabs
   // with bands flowing down through them. There's not enough horizontal room
   // between adjacent slabs to fit horizontal labels without overlap, so labels
-  // are ROTATED 90° (reading top-to-bottom). For the topmost rotated row, the
-  // label sits ABOVE the slab (rotated, reading downward TOWARDS the slab); for
-  // intermediate rows it sits ABOVE; for the BOTTOM-most row it sits BELOW.
-  // This keeps labels clear of band-flow areas.
-  const lastVColType = vCols.length ? vCols[vCols.length - 1] : null;
+  // are ROTATED 90° and ALL sit ABOVE their slab, reading bottom-to-top.
+  // With anchor=start and rotate(-90), text starts at the rotation origin
+  // (placed just above the slab) and extends upward. The label for the bottom
+  // row therefore sits in the gap between the row above it and its own slab —
+  // so VROW_SPACING must be tall enough to accommodate the longest label.
 
   // Render a label as a <text> element with computed position/anchor/rotation,
   // returning the d3 selection so the caller can wrap it in <a> or attach handlers.
   function appendLabel(parentSel, d) {
     const txt = parentSel.append("text").text(d.name);
     if (d._rotated) {
-      const isBottomRow = d.type === lastVColType;
       const cx = (d.x0 + d.x1) / 2;
-      // All rotated-region labels read bottom-to-top (rotate(-90)).
-      //  - Upper rows: label sits ABOVE the slab. With anchor=start, text starts
-      //    at the rotation origin and extends in +x pre-rotation, which after
-      //    rotate(-90) becomes -y (upward). So the closest-to-slab character is
-      //    at the origin (just above the slab) and the rest extend upward.
-      //  - Bottom row: label sits BELOW the slab. With anchor=end, text ENDS at
-      //    the rotation origin and extends in -x pre-rotation, which after
-      //    rotate(-90) becomes +y (downward). So the closest-to-slab character
-      //    is at the origin (just below the slab) and the rest extend downward.
-      // Both directions therefore read with the start-of-name closest to the
-      // slab and the end-of-name pointing away — visually consistent.
-      if (isBottomRow) {
-        const y = d.y1 + 4;
-        txt
-          .attr("x", 0).attr("y", 0)
-          .attr("text-anchor", "end")
-          .attr("transform", `translate(${cx}, ${y}) rotate(-90)`)
-          .attr("dy", "0.35em");
-      } else {
-        const y = d.y0 - 4;
-        txt
-          .attr("x", 0).attr("y", 0)
-          .attr("text-anchor", "start")
-          .attr("transform", `translate(${cx}, ${y}) rotate(-90)`)
-          .attr("dy", "0.35em");
-      }
+      const y = d.y0 - 4;
+      txt
+        .attr("x", 0).attr("y", 0)
+        .attr("text-anchor", "start")
+        .attr("transform", `translate(${cx}, ${y}) rotate(-90)`)
+        .attr("dy", "0.35em");
     } else {
       // Horizontal-region: label LEFT of the bar
       txt
