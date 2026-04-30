@@ -622,11 +622,15 @@ function renderSankey({ nodes, links, typeOrder, typeHelp }) {
       .nodePadding(8)                    // tighter padding pre-rotation since labels run vertically
       .extent([[0, 0], [preRotW, preRotH]])
       .nodeAlign(node => vColIndex.get(node.type) ?? 0)
+      // Sort DESCENDING by order in the vertical region so that nodes with
+      // lower `order` values end up on the RIGHT of each rotated row, not the
+      // LEFT. (Pre-rotation, low-order goes to low-y → top; rotation maps top
+      // to left, so flipping the sort here makes low-order map to right.)
       .nodeSort((a, b) => {
         const ao = a.order == null ? Number.POSITIVE_INFINITY : a.order;
         const bo = b.order == null ? Number.POSITIVE_INFINITY : b.order;
-        if (ao !== bo) return ao - bo;
-        return a.name.localeCompare(b.name);
+        if (ao !== bo) return bo - ao;          // <-- reversed
+        return b.name.localeCompare(a.name);    // <-- reversed tiebreaker
       });
 
     const vGraph = sankeyV({
@@ -644,28 +648,32 @@ function renderSankey({ nodes, links, typeOrder, typeHelp }) {
       n.x1 = n.x0 + nodeWidth;
     });
 
-    // For bridge target nodes: enforce their pre-rotation "height" (y1-y0) to match
-    // the size computed in pass 1. This keeps band widths consistent across the bend.
-    // We rescale this column's nodes to match — proportionally if multiple bridge targets exist.
-    // (For the typical case where each bridge target has a single phantom counterpart,
-    // we just override the y range of that node directly. Sibling nodes in the same
-    // pre-rotation column will be repacked.)
+    // Bridge-target row sizing.
+    // The first vCol is the row of bridge targets (e.g. "North-South"). By
+    // default d3-sankey would size each node to match its flow-through value,
+    // which for incoming-bridge nodes is the sum of incoming bridge band
+    // widths — typically a small fraction of the available row width.
+    //
+    // Instead we STRETCH the bridge-target row so its nodes fill the full
+    // available pre-rotation height (= post-rotation width across the row).
+    // Each node gets an equal share of the row, padded by VPADDING. Bridge
+    // bands then fan out gracefully across each node's wider top edge.
     const firstVColType = vCols[0];
     const firstColNodes = vGraph.nodes.filter(n => n.type === firstVColType);
-    // Sort top-to-bottom (pre-rotation) preserving sankey's chosen order
+    // Sort by current y0 to preserve the rotated-sort order (descending by `order`,
+    // per nodeSort above) when we repack from cursor=0.
     firstColNodes.sort((a, b) => a.y0 - b.y0);
 
-    // For each first-col node that's a bridge target, override its size to match pass 1.
-    // Repack the column from the top.
-    let cursor = 0; // pre-rotation y cursor
-    const VPADDING = 8;
+    const VPADDING = 14; // pre-rotation gap between adjacent bridge-target slabs (post-rotation: gap on row)
+    const totalPadding = Math.max(0, firstColNodes.length - 1) * VPADDING;
+    // Equal share per node from the available pre-rotation height
+    const shareLen = firstColNodes.length
+      ? Math.max(2, (preRotH - totalPadding) / firstColNodes.length)
+      : 0;
+    let cursor = 0;
     firstColNodes.forEach(n => {
-      const overrideSize = bridgeTargetSize.get(n.name);
-      const nodeLen = overrideSize != null
-        ? Math.max(2, overrideSize)
-        : Math.max(2, n.y1 - n.y0);
       n.y0 = cursor;
-      n.y1 = cursor + nodeLen;
+      n.y1 = cursor + shareLen;
       cursor = n.y1 + VPADDING;
     });
     // If repacking overflowed the available pre-rotation height, scale down proportionally
@@ -1083,22 +1091,25 @@ function renderSankey({ nodes, links, typeOrder, typeHelp }) {
     if (d._rotated) {
       const isBottomRow = d.type === lastVColType;
       const cx = (d.x0 + d.x1) / 2;
-      // Place anchor point just above (or below) the slab; rotate -90° so text
-      // reads from bottom to top (i.e. the start of the text is the side closest
-      // to the slab, far end of text points outward away from the slab).
-      // For ABOVE labels: anchor near top of text (text-anchor=start), drawn
-      // above the slab and reading downward into it.
-      // For BELOW labels: anchor near top of text, rotation pulls text downward.
+      // All rotated-region labels read bottom-to-top (rotate(-90)).
+      //  - Upper rows: label sits ABOVE the slab. With anchor=start, text starts
+      //    at the rotation origin and extends in +x pre-rotation, which after
+      //    rotate(-90) becomes -y (upward). So the closest-to-slab character is
+      //    at the origin (just above the slab) and the rest extend upward.
+      //  - Bottom row: label sits BELOW the slab. With anchor=end, text ENDS at
+      //    the rotation origin and extends in -x pre-rotation, which after
+      //    rotate(-90) becomes +y (downward). So the closest-to-slab character
+      //    is at the origin (just below the slab) and the rest extend downward.
+      // Both directions therefore read with the start-of-name closest to the
+      // slab and the end-of-name pointing away — visually consistent.
       if (isBottomRow) {
-        // BELOW the slab: y just below slab bottom; rotate 90° so text reads downward
         const y = d.y1 + 4;
         txt
           .attr("x", 0).attr("y", 0)
-          .attr("text-anchor", "start")
-          .attr("transform", `translate(${cx}, ${y}) rotate(90)`)
+          .attr("text-anchor", "end")
+          .attr("transform", `translate(${cx}, ${y}) rotate(-90)`)
           .attr("dy", "0.35em");
       } else {
-        // ABOVE the slab: y just above slab top; rotate -90° so text reads upward
         const y = d.y0 - 4;
         txt
           .attr("x", 0).attr("y", 0)
