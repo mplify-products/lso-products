@@ -476,7 +476,7 @@ function renderSankey({ nodes, links, typeOrder, typeHelp }) {
   // Add inter-row spacing so the rotated labels for each row have room to breathe.
   // Labels are rotated 90° and placed above each row, so VROW_SPACING needs to fit
   // the longest label plus padding.
-  const VROW_SPACING = 200; // vertical distance between successive rotated-column rows
+  const VROW_SPACING = 160; // vertical distance between successive rotated-column rows
   const verticalRegionHeight = hasBend ? (vCols.length * VROW_SPACING + 80) : 0;
   // Headroom above the FIRST rotated row's slabs. This is where the bridge bands
   // curve down from the horizontal region into the top of the rotated region —
