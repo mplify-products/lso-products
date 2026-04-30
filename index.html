@@ -367,41 +367,132 @@ function renderSankey({ nodes, links, typeOrder, typeHelp }) {
     source: l.source, target: l.target, value: l.value || 1
   }));
 
-  // Layout dimensions.
-  // Strategy: fluid layout when there's enough room, scale-to-fit below the
-  // readability threshold (MIN_INTERNAL_WIDTH). Height is computed from the
-  // tallest column so columns are never starved of vertical space.
-  const MIN_INTERNAL_WIDTH = 1400; // below this, we render at 1400 internal and CSS-scale down
-  const MAX_INTERNAL_WIDTH = 2200; // above this, we cap to avoid stretching too wide
+  // ============================================================
+  //  BENT SANKEY LAYOUT
+  // ============================================================
+  // The diagram is split into two regions:
+  //   - "Horizontal" region: columns 0..BEND_AFTER_COL flow left-to-right (classic Sankey)
+  //   - "Vertical"   region: columns BEND_AFTER_COL+1..end flow top-to-bottom
+  //                          (a Sankey laid out horizontally, then transposed 90°)
+  // The transition happens as "bridge links" that start with a horizontal tangent
+  // on the right edge of the last horizontal node and end with a vertical tangent
+  // on the top edge of the first vertical node — making the bands curl through 90°.
+  //
+  // Set BEND_AFTER_COL to the 0-indexed column AFTER which the bend happens.
+  // E.g. BEND_AFTER_COL = 2 means columns 0,1,2 are horizontal and 3,4,5,... are vertical.
+  const BEND_AFTER_COL = 2;
+  const hasBend = BEND_AFTER_COL >= 0 && BEND_AFTER_COL < nCols - 1;
 
-  // Generous left/right margins so labels in the first/last columns don't clip.
-  // Top margin is intentionally tight — the column headers sit at margin.top - 22,
-  // so this controls the gap between the page title and the header row.
-  const margin = { top: 36, right: 220, bottom: 24, left: 220 };
+  // Partition the columns
+  const hCols = typeOrder.slice(0, BEND_AFTER_COL + 1);            // horizontal-flow columns
+  const vCols = typeOrder.slice(BEND_AFTER_COL + 1);                // vertical-flow columns (after bend)
+  const hColTypes = new Set(hCols);
+  const vColTypes = new Set(vCols);
+
+  // Partition nodes by region
+  const hNodes = sankeyNodes.filter(n => hColTypes.has(n.type));
+  const vNodes = sankeyNodes.filter(n => vColTypes.has(n.type));
+
+  // Partition links: internal-horizontal, internal-vertical, and bridge (cross-region).
+  // A bridge link goes from a horizontal-region node to a vertical-region node.
+  const hLinks = [];
+  const vLinks = [];
+  const bridgeLinks = [];
+  sankeyLinks.forEach(l => {
+    const sNode = byName.get(l.source);
+    const tNode = byName.get(l.target);
+    if (!sNode || !tNode) return;
+    const sH = hColTypes.has(sNode.type);
+    const tH = hColTypes.has(tNode.type);
+    if (sH && tH) hLinks.push(l);
+    else if (!sH && !tH) vLinks.push(l);
+    else if (sH && !tH) bridgeLinks.push(l);
+    // (tH && !sH) — backwards link from vertical to horizontal: ignore (shouldn't exist in this data)
+  });
+
+  // ---- dimensions ----
+  const MIN_INTERNAL_WIDTH = 1400;
+  const MAX_INTERNAL_WIDTH = 2200;
+  // Right margin reserves room for rotated-row headers ("Service Schema", etc.)
+  // when the bend is active. Without the bend, the original 220px is enough for
+  // long node labels in the last column.
+  // Bottom margin reserves room for rotated 90° labels under the BOTTOM rotated
+  // row — the longest names ("Wavelength (L0) service attributes" etc.) extend
+  // ~200px below the slab when rotated, so we need a generous bottom margin.
+  const margin = { top: 36, right: 260, bottom: 220, left: 220 };
 
   const wrap = document.getElementById("chart-wrap");
   const containerWidth = wrap.clientWidth || window.innerWidth;
-
-  // Internal SVG width: what we *render at*. Always between MIN and MAX.
-  // If the iframe is narrower than MIN, we still render at MIN and let CSS scale us down.
   const internalWidth = Math.max(MIN_INTERNAL_WIDTH, Math.min(MAX_INTERNAL_WIDTH, containerWidth));
 
-  // Compute height from content: take the column with the most nodes and give
-  // each node ~22px (rect + padding). Add margins. Clamped so very sparse
-  // diagrams aren't tiny and very dense ones don't blow past readable.
-  const nodesPerCol = new Map();
-  nodes.forEach(n => nodesPerCol.set(n.type, (nodesPerCol.get(n.type) || 0) + 1));
-  const maxNodesInACol = Math.max(1, ...nodesPerCol.values());
-  const PER_NODE_HEIGHT = 22; // approximate vertical room each node consumes
-  const innerHeight = Math.max(600, Math.min(1400, maxNodesInACol * PER_NODE_HEIGHT));
+  // Per-region size budgeting:
+  //   - Horizontal region width: enough for hCols columns (left side of canvas)
+  //   - Vertical region width:   enough for the widest vertical "row" of nodes (right side)
+  //   - Vertical region height:  enough for vCols rows stacked top-to-bottom
+  //   - Horizontal region height: tall enough to hold the most-populated horizontal column
+  //
+  // We allocate a fraction of the canvas width to each region. The vertical region
+  // needs to be wide enough that the row with the most nodes fits, with a sensible
+  // node-padding budget. The horizontal region uses the rest.
+  const nodeWidth = 14;
+  const nodePadding = 10;
+
+  // How many nodes are in each column of each region?
+  const nodesByType = new Map();
+  nodes.forEach(n => {
+    if (!nodesByType.has(n.type)) nodesByType.set(n.type, 0);
+    nodesByType.set(n.type, nodesByType.get(n.type) + 1);
+  });
+  const maxNodesInHCol = Math.max(1, ...hCols.map(t => nodesByType.get(t) || 1));
+  const maxNodesInVCol = vCols.length
+    ? Math.max(1, ...vCols.map(t => nodesByType.get(t) || 1))
+    : 1;
+
+  // Estimated minimum width needed for the vertical region so the widest "row"
+  // (which becomes a column post-rotation) can hold its nodes. After rotation,
+  // each rotated-node consumes about (PER_NODE_HEIGHT) px horizontally — but
+  // labels need to read top-to-bottom (rotated 90°), so we need ~14px per node
+  // plus padding. For readability, allocate ~36px per node so rotated text
+  // labels (which sit above/below each slab) are spaced clear of one another.
+  const ROTATED_NODE_SLOT = 36; // horizontal slot per rotated node
+  const minVerticalRegionWidth = maxNodesInVCol * ROTATED_NODE_SLOT + 80;
+
+  // Allocate widths. Horizontal region gets at least 50% of inner space, vertical region the rest.
+  const innerLeft  = margin.left;
+  const innerRight = internalWidth - margin.right;
+  const innerWidthAvailable = innerRight - innerLeft;
+
+  const verticalRegionWidth = hasBend
+    ? Math.max(minVerticalRegionWidth, Math.min(innerWidthAvailable * 0.45, 700))
+    : 0;
+  const horizontalRegionWidth = innerWidthAvailable - verticalRegionWidth - (hasBend ? 40 : 0); // 40px gap
+
+  // Heights: horizontal region is tall enough for its tallest column; vertical region's
+  // height follows from how many vCols there are (each row needs ~80px of vertical room
+  // plus space for the rotated-text labels between rows).
+  const PER_NODE_HEIGHT = 22;
+  const horizontalRegionHeight = Math.max(360, Math.min(900, maxNodesInHCol * PER_NODE_HEIGHT));
+
+  // Vertical region: need room for vCols rows. Each row is one "column" of nodes (after rotation).
+  // Add inter-row spacing so the rotated labels for each row have room to breathe.
+  // Labels are rotated 90° and placed above each row (or below, for the bottom row),
+  // so VROW_SPACING needs to fit the longest label plus padding.
+  const VROW_SPACING = 160; // vertical distance between successive rotated-column rows
+  const verticalRegionHeight = hasBend ? (vCols.length * VROW_SPACING + 80) : 0;
+  // Headroom above the FIRST rotated row's slabs, so the row's rotated 90° labels
+  // (which extend upward from the slab) have clear space and don't collide with
+  // the horizontal-region column headers up at margin.top - 22.
+  const VROW_SPACING_TOP_PAD = hasBend ? 130 : 0;
+
+  const innerHeight = hasBend
+    ? Math.max(horizontalRegionHeight, VROW_SPACING_TOP_PAD + verticalRegionHeight) + 30
+    : horizontalRegionHeight;
   const internalHeight = innerHeight + margin.top + margin.bottom;
 
   const width  = internalWidth;
   const height = internalHeight;
 
   const svg = d3.select("#chart")
-    // viewBox carries the internal coordinate system; the SVG element resizes
-    // fluidly via CSS to fit the iframe, scaling everything proportionally.
     .attr("viewBox", `0 0 ${width} ${height}`)
     .attr("preserveAspectRatio", "xMidYMid meet")
     .style("width", "100%")
@@ -410,28 +501,52 @@ function renderSankey({ nodes, links, typeOrder, typeHelp }) {
     .style("display", "block");
   svg.selectAll("*").remove();
 
-  // Configure sankey generator
-  const nodeWidth = 14;
-  const nodePadding = 10;
+  // Region extents (in canvas coordinates)
+  const hRegion = {
+    x0: innerLeft,
+    x1: innerLeft + horizontalRegionWidth,
+    y0: margin.top,
+    y1: margin.top + horizontalRegionHeight
+  };
+  const vRegion = {
+    x0: hRegion.x1 + 40,
+    x1: innerRight,
+    y0: hRegion.y0 + VROW_SPACING_TOP_PAD,
+    y1: hRegion.y0 + VROW_SPACING_TOP_PAD + verticalRegionHeight
+  };
 
-  const sankey = d3.sankey()
+  // ---- Pass 1: layout the HORIZONTAL region ----
+  // Includes: all hNodes, plus the vNodes that are direct targets of bridge links
+  // (so the d3-sankey layout assigns proper widths/heights to the col-2 source nodes
+  // accounting for ALL outgoing flow). The bridge-target nodes get re-positioned in pass 2.
+  // Trick: we include the bridge-target nodes as a "phantom column" to the right of hCols
+  // so their widths flow into the layout, but we then discard their x/y from this pass.
+  const hColIndex = new Map();
+  hCols.forEach((t, i) => hColIndex.set(t, i));
+  // Phantom column for bridge targets (col index = hCols.length)
+  const phantomColCount = hCols.length + (bridgeLinks.length ? 1 : 0);
+
+  // Build the horizontal-pass node list. Bridge-target nodes are duplicated as
+  // phantoms (with a marker) to drive the layout, but we'll only use the real nodes' positions.
+  const bridgeTargetNames = new Set(bridgeLinks.map(l => l.target));
+  const hPassNodes = [
+    ...hNodes.map(n => ({ ...n, _region: "h" })),
+    ...vNodes.filter(n => bridgeTargetNames.has(n.name)).map(n => ({ ...n, _region: "phantom" }))
+  ];
+  const hPassLinks = [
+    ...hLinks.map(l => ({ ...l })),
+    ...bridgeLinks.map(l => ({ ...l }))
+  ];
+
+  const sankeyH = d3.sankey()
     .nodeId(d => d.name)
     .nodeWidth(nodeWidth)
     .nodePadding(nodePadding)
-    .extent([[margin.left, margin.top], [width - margin.right, height - margin.bottom]])
-    // Force column index by node type:
+    .extent([[hRegion.x0, hRegion.y0], [hRegion.x1, hRegion.y1]])
     .nodeAlign(node => {
-      const idx = colIndex.has(node.type) ? colIndex.get(node.type) : 0;
-      return idx;
+      if (node._region === "phantom") return phantomColCount - 1;
+      return hColIndex.has(node.type) ? hColIndex.get(node.type) : 0;
     })
-    // Vertical order within each column:
-    //  - nodes with a numeric `order` value sort FIRST, ascending (lower = higher up)
-    //  - nodes without `order` fall back to alphabetical by name (stable tiebreaker)
-    //
-    // Note: setting nodeSort replaces d3-sankey's automatic crossing-minimisation
-    // for ALL columns, not just Product. To control column N, fill in `order` for
-    // the rows of type N in the nodes sheet. Rows without an order get sunk to the
-    // bottom in alphabetical order.
     .nodeSort((a, b) => {
       const ao = a.order == null ? Number.POSITIVE_INFINITY : a.order;
       const bo = b.order == null ? Number.POSITIVE_INFINITY : b.order;
@@ -439,29 +554,267 @@ function renderSankey({ nodes, links, typeOrder, typeHelp }) {
       return a.name.localeCompare(b.name);
     });
 
-  // Provide nodes/links objects the layout can mutate
-  const graph = sankey({
-    nodes: sankeyNodes.map(d => Object.assign({}, d)),
-    links: sankeyLinks.map(d => Object.assign({}, d))
+  const hGraph = sankeyH({
+    nodes: hPassNodes.map(d => ({ ...d })),
+    links: hPassLinks.map(d => ({ ...d }))
   });
 
-  // After layout, snap each node to its prescribed column x by overriding x0/x1
-  const colCount = nCols;
-  const innerLeft  = margin.left;
-  const innerRight = width - margin.right;
-  const colSpacing = (innerRight - innerLeft - nodeWidth) / Math.max(1, colCount - 1);
-  const colXs = d3.range(colCount).map(i => innerLeft + i * colSpacing);
-
-  graph.nodes.forEach(n => {
-    const ci = colIndex.has(n.type) ? colIndex.get(n.type) : 0;
-    n.x0 = colXs[ci];
-    n.x1 = n.x0 + nodeWidth;
+  // Snap horizontal-region nodes to clean column x positions
+  const hColXs = d3.range(hCols.length).map(i =>
+    hRegion.x0 + i * (horizontalRegionWidth - nodeWidth) / Math.max(1, hCols.length - 1)
+  );
+  hGraph.nodes.forEach(n => {
+    if (n._region === "h") {
+      const ci = hColIndex.get(n.type) ?? 0;
+      n.x0 = hColXs[ci];
+      n.x1 = n.x0 + nodeWidth;
+    }
   });
 
-  // Re-run only the link path generator after x re-snapping by re-calling
-  // sankey on the updated structure with the same vertical positions preserved.
-  // Easiest: call sankey.update() which recomputes link paths from current node coords.
-  sankey.update(graph);
+  // Capture the heights/y-extents of bridge-target phantom nodes so we can match them
+  // to the corresponding rotated nodes' "lengths" in pass 2. Each phantom's (y1 - y0)
+  // represents the total flow into that bridge target, which must match the rotated
+  // node's pre-rotation "width" (its post-rotation "height") so bands align.
+  const bridgeTargetSize = new Map(); // name -> length (in pixels)
+  hGraph.nodes.forEach(n => {
+    if (n._region === "phantom") {
+      bridgeTargetSize.set(n.name, n.y1 - n.y0);
+    }
+  });
+
+  // Final list of horizontal-region nodes (real ones only, with positions set)
+  const hRealNodes = hGraph.nodes.filter(n => n._region === "h");
+
+  // The bridge link entries from hGraph have correct source-side y geometry but
+  // their target-side geometry is on the phantom. We'll re-derive bridge endpoints
+  // after pass 2 sets up the rotated targets. Save the source-side data now.
+  const bridgeFromHGraph = hGraph.links.filter(l => bridgeTargetNames.has(l.target.name));
+  // bridgeFromHGraph entries have: l.source (h-node), l.target (phantom),
+  // l.y0 (source-side y center), l.y1 (target-side y center, from phantom — IGNORE),
+  // l.width (band thickness)
+
+  // ---- Pass 2: layout the VERTICAL region ----
+  // Run a second d3-sankey on the vertical-region subgraph laid out horizontally
+  // (left-to-right within a thin band), then transpose to rotate 90° clockwise.
+  // After rotation:
+  //   - the original x-axis becomes the y-axis (flow direction = downward)
+  //   - the original y-axis becomes the x-axis (across the rotated row)
+  //
+  // Pre-rotation extent: a rectangle of size (verticalRegionHeight, verticalRegionWidth).
+  //   - "width" of pre-rotation rect = verticalRegionHeight (the flow direction post-rotation)
+  //   - "height" of pre-rotation rect = verticalRegionWidth (the cross-flow span post-rotation)
+  let vRealNodes = [];
+  let vRealLinks = [];
+  let bridgeLinksFinal = [];
+
+  if (hasBend && vNodes.length) {
+    const vColIndex = new Map();
+    vCols.forEach((t, i) => vColIndex.set(t, i));
+
+    // Pre-rotation extent. The "outer" axis (pre-rotation x) = vertical flow span.
+    // The "inner" axis (pre-rotation y) = horizontal span across the rotated row.
+    const preRotW = verticalRegionHeight;
+    const preRotH = verticalRegionWidth;
+
+    const sankeyV = d3.sankey()
+      .nodeId(d => d.name)
+      .nodeWidth(nodeWidth)              // pre-rotation node "width" → post-rotation node HEIGHT (flow direction)
+      .nodePadding(8)                    // tighter padding pre-rotation since labels run vertically
+      .extent([[0, 0], [preRotW, preRotH]])
+      .nodeAlign(node => vColIndex.get(node.type) ?? 0)
+      .nodeSort((a, b) => {
+        const ao = a.order == null ? Number.POSITIVE_INFINITY : a.order;
+        const bo = b.order == null ? Number.POSITIVE_INFINITY : b.order;
+        if (ao !== bo) return ao - bo;
+        return a.name.localeCompare(b.name);
+      });
+
+    const vGraph = sankeyV({
+      nodes: vNodes.map(d => ({ ...d, _region: "v" })),
+      links: vLinks.map(d => ({ ...d }))
+    });
+
+    // Snap vertical-region nodes to clean pre-rotation column x positions
+    const vColXsPre = d3.range(vCols.length).map(i =>
+      i * (preRotW - nodeWidth) / Math.max(1, vCols.length - 1)
+    );
+    vGraph.nodes.forEach(n => {
+      const ci = vColIndex.get(n.type) ?? 0;
+      n.x0 = vColXsPre[ci];
+      n.x1 = n.x0 + nodeWidth;
+    });
+
+    // For bridge target nodes: enforce their pre-rotation "height" (y1-y0) to match
+    // the size computed in pass 1. This keeps band widths consistent across the bend.
+    // We rescale this column's nodes to match — proportionally if multiple bridge targets exist.
+    // (For the typical case where each bridge target has a single phantom counterpart,
+    // we just override the y range of that node directly. Sibling nodes in the same
+    // pre-rotation column will be repacked.)
+    const firstVColType = vCols[0];
+    const firstColNodes = vGraph.nodes.filter(n => n.type === firstVColType);
+    // Sort top-to-bottom (pre-rotation) preserving sankey's chosen order
+    firstColNodes.sort((a, b) => a.y0 - b.y0);
+
+    // For each first-col node that's a bridge target, override its size to match pass 1.
+    // Repack the column from the top.
+    let cursor = 0; // pre-rotation y cursor
+    const VPADDING = 8;
+    firstColNodes.forEach(n => {
+      const overrideSize = bridgeTargetSize.get(n.name);
+      const nodeLen = overrideSize != null
+        ? Math.max(2, overrideSize)
+        : Math.max(2, n.y1 - n.y0);
+      n.y0 = cursor;
+      n.y1 = cursor + nodeLen;
+      cursor = n.y1 + VPADDING;
+    });
+    // If repacking overflowed the available pre-rotation height, scale down proportionally
+    if (cursor > preRotH && cursor > 0) {
+      const scale = preRotH / cursor;
+      firstColNodes.forEach(n => {
+        n.y0 *= scale;
+        n.y1 *= scale;
+      });
+    }
+
+    sankeyV.update(vGraph);
+
+    // Transpose (rotate 90° clockwise) and translate into the vRegion.
+    //   - new_x = vRegion.x0 + old_y
+    //   - new_y = vRegion.y0 + old_x
+    // Node rectangles flip orientation: pre-rotation rect (nodeWidth × nodeHeight)
+    // becomes post-rotation (nodeHeight × nodeWidth).
+    // We keep node.x0/x1/y0/y1 semantics (top-left and bottom-right of post-rotation rect).
+    vGraph.nodes.forEach(n => {
+      const oldX0 = n.x0, oldX1 = n.x1, oldY0 = n.y0, oldY1 = n.y1;
+      n.x0 = vRegion.x0 + oldY0;
+      n.x1 = vRegion.x0 + oldY1;
+      n.y0 = vRegion.y0 + oldX0;
+      n.y1 = vRegion.y0 + oldX1;
+      n._rotated = true;
+    });
+
+    // Transpose link source/target endpoints similarly. d3-sankey's link objects
+    // expose s.x1, s.y0, etc. via source/target node refs. The pre-computed
+    // l.y0 / l.y1 (link endpoint y centers, on a per-band basis) need to be
+    // remapped: in pre-rotation, l.y0 is a y-coordinate within the source's
+    // y range. After rotation, that becomes an x-coordinate within the source's
+    // post-rotation x range.
+    // We won't use d3-sankey's stored l.y0/l.y1 directly — instead, we'll
+    // recompute paths from scratch using the rotated node geometries.
+    vGraph.links.forEach(l => { l._rotated = true; });
+
+    vRealNodes = vGraph.nodes;
+    vRealLinks = vGraph.links;
+
+    // ---- Bridge link finalisation ----
+    // For each bridge link, we have:
+    //   - source: an h-node with computed y geometry (from pass 1)
+    //   - target: a v-node with rotated geometry (from pass 2, first vCol)
+    // The bridge band needs to:
+    //   - leave the source's RIGHT edge at the y-center for this band's slice
+    //   - enter the target's TOP edge at the x-center for this band's slice
+    // We compute per-link source-y0 (top of band on source side) and
+    //          per-link target-x0 (left of band on target side) by accumulating
+    // along the source's right edge and the target's top edge.
+    //
+    // To do this correctly, we need to know each link's "width" (in pixels), the
+    // order of bands stacked at each endpoint, and the band's offset within the node.
+    // We'll lift this from the pass-1 sankey result: bridgeFromHGraph entries have
+    // their source-side y center and width already computed, and we know the order.
+
+    // Build a map from bridge link -> source-side band geometry (from pass 1)
+    const bridgeKey = (s, t) => `${s}\u0001${t}`;
+    const sourceBandGeom = new Map(); // key -> { y0, y1, width }
+    bridgeFromHGraph.forEach(l => {
+      const w = l.width;
+      // l.y0 is the band CENTER y on the source side (per d3-sankey convention)
+      sourceBandGeom.set(bridgeKey(l.source.name, l.target.name), {
+        yCenter: l.y0,
+        width: w
+      });
+    });
+
+    // For the target side, we need to lay out the incoming bands on the TOP edge
+    // of each rotated target node, in the same order they leave their source columns.
+    // Group bridges by target, sum widths, and pack left-to-right across the
+    // rotated target node's TOP edge (which spans target.x0 → target.x1).
+    const bridgesByTarget = new Map();
+    bridgeLinks.forEach(bl => {
+      const arr = bridgesByTarget.get(bl.target) || [];
+      arr.push(bl);
+      bridgesByTarget.set(bl.target, arr);
+    });
+
+    const vNodeByName = new Map(vRealNodes.map(n => [n.name, n]));
+
+    bridgesByTarget.forEach((bridgeArr, targetName) => {
+      const tNode = vNodeByName.get(targetName);
+      if (!tNode) return;
+
+      // Sort bridges arriving at this target by their source-band yCenter (top-to-bottom).
+      // After rotation, "top-to-bottom on the source side" maps to "left-to-right on the
+      // target's top edge", which keeps the bands from crossing each other through the bend.
+      const decorated = bridgeArr.map(bl => {
+        const g = sourceBandGeom.get(bridgeKey(bl.source, bl.target));
+        return { bl, g, sortKey: g ? g.yCenter : 0 };
+      }).sort((a, b) => a.sortKey - b.sortKey);
+
+      // Pack along the target's TOP edge from left (tNode.x0) to right (tNode.x1)
+      const totalTopSpan = tNode.x1 - tNode.x0;
+      const totalBandWidth = decorated.reduce((s, d) => s + (d.g ? d.g.width : 1), 0);
+      // If the sum of band widths exceeds the top edge, scale them down proportionally.
+      const scale = totalBandWidth > totalTopSpan ? totalTopSpan / totalBandWidth : 1;
+      let cur = tNode.x0;
+      decorated.forEach(d => {
+        const w = (d.g ? d.g.width : 1) * scale;
+        d.targetXLeft = cur;
+        d.targetXRight = cur + w;
+        d.targetXCenter = cur + w / 2;
+        d.bandWidth = w;
+        cur += w;
+      });
+
+      // Build final bridge link records
+      decorated.forEach(d => {
+        const g = d.g || { yCenter: 0, width: 1 };
+        const sNode = byName.get(d.bl.source);
+        // We need the source x1 too — find the corresponding hRealNode
+        const sRealNode = hRealNodes.find(n => n.name === d.bl.source);
+        if (!sRealNode) return;
+        bridgeLinksFinal.push({
+          source: sRealNode,
+          target: tNode,
+          // Source-side band: horizontal exit at sRealNode.x1, centered at yCenter
+          sourceX: sRealNode.x1,
+          sourceYCenter: g.yCenter,
+          // Target-side band: vertical entry at tNode.y0, centered at targetXCenter
+          targetXCenter: d.targetXCenter,
+          targetY: tNode.y0,
+          width: d.bandWidth,
+          // Keep originals for tooltip/highlight
+          _origSourceName: d.bl.source,
+          _origTargetName: d.bl.target,
+          value: d.bl.value || 1
+        });
+      });
+    });
+  }
+
+  // ---- Build a unified graph object for downstream rendering ----
+  // graph.nodes has both regions; graph.links combines internal-h, internal-v,
+  // and bridges (bridges marked specially so the path generator handles them).
+  const graph = {
+    nodes: [...hRealNodes, ...vRealNodes],
+    links: [
+      ...hGraph.links.filter(l => !bridgeTargetNames.has(l.target.name)),
+      ...vRealLinks,
+      ...bridgeLinksFinal.map(b => ({ ...b, _bridge: true }))
+    ]
+  };
+
+  // For convenience downstream, expose a list of column x positions (horizontal region only)
+  const colXs = hColXs;
 
   // Column headers: title text + (?) help icon (when help text exists for that type).
   const headers = svg.append("g").attr("class", "col-headers");
@@ -480,31 +833,63 @@ function renderSankey({ nodes, links, typeOrder, typeHelp }) {
   }
   window.__lsoSankeyPinned = null;
 
+  // After the bend, each "column" in the data becomes a "row" of nodes in the
+  // rotated section. We place those headers to the LEFT of each row instead of
+  // above each column, so they read top-to-bottom alongside the flow direction.
+  // To compute the y-position of each rotated row, we average the y-centers of
+  // the rotated nodes belonging to that vCol type.
+  const rotatedRowY = new Map(); // vCol type -> y center of its row
+  if (hasBend) {
+    vCols.forEach(t => {
+      const rowNodes = vRealNodes.filter(n => n.type === t);
+      if (rowNodes.length) {
+        const yCenter = d3.mean(rowNodes, n => (n.y0 + n.y1) / 2);
+        rotatedRowY.set(t, yCenter);
+      }
+    });
+  }
+
   typeOrder.forEach((t, i) => {
     const help = typeHelp && typeHelp.get(t);
-    const cx = colXs[i] + nodeWidth / 2;
-    const headerY = margin.top - 22;
+    const isHorizontalCol = i <= BEND_AFTER_COL;
+
+    let cx, cy, anchor;
+    if (isHorizontalCol) {
+      cx = hColXs[i] + nodeWidth / 2;
+      cy = margin.top - 22;
+      anchor = "middle";
+    } else {
+      // Rotated row: header sits to the RIGHT of the row (past the last slab),
+      // vertically centered on the row. We place it at vRegion.x1 + a small gap,
+      // anchored "start" so the text reads left-to-right outward from the row.
+      // This keeps headers clear of the bridge-curl area to the left of the row.
+      cx = vRegion.x1 + 12;
+      cy = rotatedRowY.get(t) ?? margin.top - 22;
+      anchor = "start";
+    }
 
     const headerGroup = headers.append("g")
       .attr("class", "col-header-group")
-      .attr("transform", `translate(${cx}, ${headerY})`);
+      .attr("transform", `translate(${cx}, ${cy})`);
 
     const titleText = headerGroup.append("text")
       .attr("class", "col-header")
-      .attr("text-anchor", "middle")
-      .attr("dy", "0")
+      .attr("text-anchor", anchor)
+      .attr("dy", isHorizontalCol ? "0" : "0.35em")
       .text(t);
 
     if (help) {
       // Measure the title to position the (?) icon just to the right of it.
-      // getBBox() works because the element is already in the DOM at this point.
+      // Both horizontal-col headers (anchor=middle) and rotated-row headers
+      // (anchor=start) extend their text rightward from x=0 by some amount, so
+      // the icon goes a small gap to the right of the bbox right edge.
       const bbox = titleText.node().getBBox();
-      const iconX = bbox.width / 2 + 10; // 10px gap from end of title
+      const iconX = bbox.x + bbox.width + 10;
       const iconR = 7;
 
       const helpIcon = headerGroup.append("g")
         .attr("class", "help-icon")
-        .attr("transform", `translate(${iconX}, -4)`)
+        .attr("transform", `translate(${iconX}, ${isHorizontalCol ? -4 : 0})`)
         .attr("tabindex", 0)
         .attr("role", "button")
         .attr("aria-label", `Help: ${t}`)
@@ -582,12 +967,81 @@ function renderSankey({ nodes, links, typeOrder, typeHelp }) {
     .attr("fill", "none")
     .attr("stroke-linecap", "butt");
 
+  // Path generators for each link kind:
+  //  - Horizontal (default): standard d3-sankey horizontal-flow Bézier
+  //  - Vertical (rotated):   same shape but rotated 90° clockwise — the curve runs
+  //                          from a node's bottom edge into the next node's top edge
+  //  - Bridge (elbow):       starts horizontal at the source's right edge, curves
+  //                          90° clockwise, ends vertical at the target's top edge
+  const horizontalPath = d3.sankeyLinkHorizontal();
+
+  // Vertical-flow Bézier between two rotated nodes. Source's bottom-edge centerline
+  // (at x = sourceXCenter on the band, y = sourceY1) curves to target's top-edge
+  // centerline (at x = targetXCenter, y = targetY0). Control points sit at the
+  // half-way y so the curve's tangents are vertical at both ends.
+  function verticalPathForRotatedLink(l) {
+    const s = l.source, t = l.target;
+    // d3-sankey's link.y0 / link.y1 are *band centers* in the pre-rotation y-axis,
+    // which after rotation becomes the post-rotation x-axis. So the band center
+    // x-position on the source is (s.x0 + (l.y0 - s.y0_pre)) — but we don't have
+    // y0_pre stored. Easier: re-derive band x-centers by accumulating link widths
+    // along the source's bottom edge and the target's top edge.
+    // We do that pre-pass below, attaching _xs (source x center) and _xt (target x center)
+    // to each rotated link.
+    const sx = l._xs, tx = l._xt;
+    const sy = s.y1, ty = t.y0;
+    const my = (sy + ty) / 2;
+    return `M${sx},${sy}C${sx},${my} ${tx},${my} ${tx},${ty}`;
+  }
+
+  // Bridge elbow path. Starts at (sourceX, sourceYCenter) with horizontal tangent
+  // (i.e. heading right), ends at (targetXCenter, targetY) with vertical tangent
+  // (i.e. heading down). A cubic Bézier with control points placed to enforce these
+  // tangents creates a smooth quarter-turn.
+  function bridgeElbowPath(l) {
+    const sx = l.sourceX;
+    const sy = l.sourceYCenter;
+    const tx = l.targetXCenter;
+    const ty = l.targetY;
+    // Distance to travel horizontally and vertically through the bend.
+    const dx = tx - sx;
+    const dy = ty - sy;
+    // Control points: first CP shifted right from start (horizontal tangent),
+    // second CP shifted up from end (vertical tangent). Magnitude ~60% of the
+    // respective distance gives a smooth 90° turn that doesn't pinch or overshoot.
+    const cp1x = sx + dx * 0.55;
+    const cp1y = sy;
+    const cp2x = tx;
+    const cp2y = ty - dy * 0.55;
+    return `M${sx},${sy}C${cp1x},${cp1y} ${cp2x},${cp2y} ${tx},${ty}`;
+  }
+
+  // ---- Pre-pass for vertical-region links: compute band x-centers ----
+  // d3-sankey populated link.y0 (source-side center) and link.y1 (target-side center)
+  // in pre-rotation coords. We need to translate those to post-rotation x-coords,
+  // which are simply (vRegion.x0 + pre_y_center).
+  graph.links.forEach(l => {
+    if (l._rotated) {
+      // After rotation, source-side band center x = vRegion.x0 + l.y0 (pre-rotation)
+      // and target-side band center x = vRegion.x0 + l.y1 (pre-rotation).
+      // BUT — d3-sankey may have already mutated l.y0/l.y1 if .update() was called
+      // post-rotation (it wasn't here), so these are still pre-rotation values.
+      l._xs = vRegion.x0 + l.y0;
+      l._xt = vRegion.x0 + l.y1;
+    }
+  });
+
+  // ---- Draw all links with a unified selection but path-by-kind ----
   const linkSel = linkLayer.selectAll("path")
     .data(graph.links)
     .join("path")
       .attr("class", "link")
-      .attr("d", d3.sankeyLinkHorizontal())
-      .attr("stroke-width", d => Math.max(1, d.width));
+      .attr("d", l => {
+        if (l._bridge) return bridgeElbowPath(l);
+        if (l._rotated) return verticalPathForRotatedLink(l);
+        return horizontalPath(l);
+      })
+      .attr("stroke-width", l => Math.max(1, l.width || l.bandWidth || 1));
 
   // Nodes
   const nodeLayer = svg.append("g").attr("class", "nodes");
@@ -606,47 +1060,80 @@ function renderSankey({ nodes, links, typeOrder, typeHelp }) {
     .attr("rx", 1)
     .attr("ry", 1);
 
-  // Labels: left of the rect for the first 4 columns, right of the rect for columns 5–7.
-  // The screenshot puts labels LEFT of column 1–4 and RIGHT of columns 5–7 (Mapping onward).
-  const LABEL_RIGHT_FROM_COL = 4; // 0-indexed: columns >= 4 get labels on the right
-  const labelX = d => {
-    const ci = colIndex.has(d.type) ? colIndex.get(d.type) : 0;
-    return ci >= LABEL_RIGHT_FROM_COL ? d.x1 + 6 : d.x0 - 6;
-  };
-  const labelAnchor = d => {
-    const ci = colIndex.has(d.type) ? colIndex.get(d.type) : 0;
-    return ci >= LABEL_RIGHT_FROM_COL ? "start" : "end";
-  };
+  // Label placement strategy:
+  //
+  // For HORIZONTAL-region nodes (cols 0..BEND_AFTER_COL), labels sit beside the
+  // narrow vertical bar — to the LEFT of each rect. (After the bend, the
+  // horizontal region only goes up to col BEND_AFTER_COL, and putting labels on
+  // the LEFT for every horizontal-region column matches the original style.)
+  //
+  // For ROTATED nodes (vCols, post-rotation), nodes are wide horizontal slabs
+  // with bands flowing down through them. There's not enough horizontal room
+  // between adjacent slabs to fit horizontal labels without overlap, so labels
+  // are ROTATED 90° (reading top-to-bottom). For the topmost rotated row, the
+  // label sits ABOVE the slab (rotated, reading downward TOWARDS the slab); for
+  // intermediate rows it sits ABOVE; for the BOTTOM-most row it sits BELOW.
+  // This keeps labels clear of band-flow areas.
+  const lastVColType = vCols.length ? vCols[vCols.length - 1] : null;
+
+  // Render a label as a <text> element with computed position/anchor/rotation,
+  // returning the d3 selection so the caller can wrap it in <a> or attach handlers.
+  function appendLabel(parentSel, d) {
+    const txt = parentSel.append("text").text(d.name);
+    if (d._rotated) {
+      const isBottomRow = d.type === lastVColType;
+      const cx = (d.x0 + d.x1) / 2;
+      // Place anchor point just above (or below) the slab; rotate -90° so text
+      // reads from bottom to top (i.e. the start of the text is the side closest
+      // to the slab, far end of text points outward away from the slab).
+      // For ABOVE labels: anchor near top of text (text-anchor=start), drawn
+      // above the slab and reading downward into it.
+      // For BELOW labels: anchor near top of text, rotation pulls text downward.
+      if (isBottomRow) {
+        // BELOW the slab: y just below slab bottom; rotate 90° so text reads downward
+        const y = d.y1 + 4;
+        txt
+          .attr("x", 0).attr("y", 0)
+          .attr("text-anchor", "start")
+          .attr("transform", `translate(${cx}, ${y}) rotate(90)`)
+          .attr("dy", "0.35em");
+      } else {
+        // ABOVE the slab: y just above slab top; rotate -90° so text reads upward
+        const y = d.y0 - 4;
+        txt
+          .attr("x", 0).attr("y", 0)
+          .attr("text-anchor", "start")
+          .attr("transform", `translate(${cx}, ${y}) rotate(-90)`)
+          .attr("dy", "0.35em");
+      }
+    } else {
+      // Horizontal-region: label LEFT of the bar
+      txt
+        .attr("x", d.x0 - 6)
+        .attr("y", (d.y0 + d.y1) / 2)
+        .attr("dy", "0.35em")
+        .attr("text-anchor", "end");
+    }
+    return txt;
+  }
 
   // For nodes WITH a url, wrap the label in an SVG <a>; for nodes without, plain <text>.
   // We also propagate hover/click events from the link into the same highlight pipeline
   // used by the rect-hit-area, so hovering a label highlights its flow.
   nodeG.each(function (d) {
     const g = d3.select(this);
-    const x = labelX(d);
-    const y = (d.y0 + d.y1) / 2;
-    const anchor = labelAnchor(d);
     if (d.url) {
       const a = g.append("a")
         .attr("href", d.url)
         .attr("target", "_blank")
         .attr("rel", "noopener noreferrer")
-        // Tooltip-style title: native browser tooltip as a fallback (e.g. when JS tooltip is off-screen).
         .attr("aria-label", `${d.name} — opens in a new tab`);
-      a.append("text")
-        .attr("x", x).attr("y", y).attr("dy", "0.35em")
-        .attr("text-anchor", anchor)
-        .text(d.name);
+      appendLabel(a, d);
       a.on("mouseenter", function (event) { highlightNode(d, event); })
        .on("mouseleave", function () { clearHighlight(); })
-       // Clear highlight on click too — the new tab opens but mouseleave may not fire on the
-       // current page reliably, so explicitly reset state.
        .on("click", function () { clearHighlight(); });
     } else {
-      g.append("text")
-        .attr("x", x).attr("y", y).attr("dy", "0.35em")
-        .attr("text-anchor", anchor)
-        .text(d.name);
+      appendLabel(g, d);
     }
   });
 
